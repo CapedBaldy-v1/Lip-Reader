@@ -1,0 +1,38 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Logs and artifacts
+logs/
+artifacts/
+
+# Checkpoints and outputs
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Datasets and generated data
+data/
+datasets/
+videos/
+labels/
+*.npy
+lrs3_download/
+
+# Research papers
+other research papers/
+
+# Temporary files
+temp_video.mp4
+
+# Local handoff doc
+HANDOFF.md

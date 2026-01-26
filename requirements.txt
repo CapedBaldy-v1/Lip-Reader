@@ -1,0 +1,32 @@
+# Swin-VALLR Requirements
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# AMD Windows Support (optional - install manually if needed)
+# torch-directml
+
+# Transformers & PEFT
+transformers>=4.36.0
+peft>=0.7.0
+accelerate>=0.25.0
+
+# Computer Vision
+opencv-python>=4.8.0
+mediapipe==0.10.11
+numpy>=1.24.0,<2.0
+Pillow>=10.0.0
+
+# Data & Utilities
+huggingface_hub>=0.19.0
+tqdm>=4.66.0
+scipy>=1.11.0
+
+# Demo UI
+streamlit>=1.29.0
+streamlit-webrtc>=0.47.0
+av>=10.0.0
+
+# Training
+tensorboard>=2.15.0
