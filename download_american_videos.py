@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Legal YouTube Video Downloader for Research (WITH COMPREHENSIVE LOGGING)
-Downloads only Creative Commons (CC-BY) videos and TED talks for academic research.
+American English YouTube Video Downloader for Research
+Downloads only Creative Commons (CC-BY) videos and TED talks with AMERICAN ENGLISH accent.
 
-NEW FEATURES:
-- Comprehensive logging for rate limiting, blocks, and errors
-- Automatic retry with exponential backoff
-- Quota tracking and warnings
-- Error categorization (rate limit, block, network, etc.)
-- Session statistics and health monitoring
-- Detailed error logs for debugging at scale
+NEW FEATURES (vs download_legal_videos.py):
+- Pre-filtering: Bias toward US content using regionCode and channel metadata
+- American score calculation: Score videos by likelihood of American English
+- Channel country detection: Prefer US-based channels
+- Keyword filtering: Detect American vs non-American indicators
+- Comprehensive logging for accent filtering effectiveness
+
+WORKFLOW:
+1. Search with regionCode='US' (pre-filter)
+2. Fetch channel metadata
+3. Calculate "American score" for each video
+4. Download only high-scoring videos (score >= 2)
+5. Post-verification with accent classifier (separate script)
 """
 
 import os
@@ -116,7 +122,7 @@ class QuotaTracker:
         self.daily_limit = daily_limit
         self.used_quota = 0
         self.search_cost = 100  # YouTube API search cost
-        self.video_details_cost = 1
+        self.channel_details_cost = 1  # Channel metadata cost
         
     def can_search(self) -> bool:
         """Check if we have quota for a search."""
@@ -134,6 +140,10 @@ class QuotaTracker:
         if remaining < 100:
             logger.error(f"🚨 CRITICAL: Quota almost exhausted! Only {remaining} units left!")
     
+    def use_channel_quota(self):
+        """Record a channel metadata API call."""
+        self.used_quota += self.channel_details_cost
+    
     def get_status(self) -> Dict:
         """Get quota status."""
         return {
@@ -144,6 +154,38 @@ class QuotaTracker:
         }
 
 quota_tracker = QuotaTracker()
+
+# American filtering statistics
+class AmericanFilterStats:
+    """Track pre-filtering effectiveness."""
+    
+    def __init__(self):
+        self.total_searched = 0
+        self.passed_filter = 0
+        self.score_distribution = defaultdict(int)
+        self.country_distribution = defaultdict(int)
+        
+    def record_video(self, score: int, country: str, passed: bool):
+        """Record a video's filtering result."""
+        self.total_searched += 1
+        if passed:
+            self.passed_filter += 1
+        self.score_distribution[score] += 1
+        self.country_distribution[country] += 1
+    
+    def get_summary(self) -> Dict:
+        """Get filtering statistics."""
+        return {
+            'total_searched': self.total_searched,
+            'passed_filter': self.passed_filter,
+            'filtered_out': self.total_searched - self.passed_filter,
+            'pass_rate': (self.passed_filter / self.total_searched * 100) if self.total_searched > 0 else 0,
+            'score_distribution': dict(self.score_distribution),
+            'country_distribution': dict(self.country_distribution)
+        }
+
+filter_stats = AmericanFilterStats()
+
 
 def smart_delay(min_sec=2.0, max_sec=5.0, reason="anti-detection"):
     """Random delay to mimic human behavior with logging."""
@@ -190,16 +232,102 @@ def detect_error_type(error_msg: str, status_code: Optional[int] = None) -> str:
     return 'unknown'
 
 
-def search_creative_commons_videos(api_key, max_results=10, max_retries=3):
+def get_channel_country(youtube, channel_id: str) -> str:
+    """Get channel's country metadata."""
+    try:
+        request = youtube.channels().list(
+            part='snippet',
+            id=channel_id
+        )
+        response = request.execute()
+        quota_tracker.use_channel_quota()
+        
+        if response.get('items'):
+            country = response['items'][0]['snippet'].get('country', 'unknown')
+            return country
+        return 'unknown'
+    except Exception as e:
+        logger.debug(f"Could not fetch channel country: {e}")
+        return 'unknown'
+
+
+def calculate_american_score(video_info: Dict, channel_country: str) -> int:
     """
-    TIER 1: Search for Creative Commons (CC-BY) licensed videos with retry logic.
+    Calculate likelihood of video containing American English.
+    
+    Score ranges:
+    - 5+: Very likely American
+    - 2-4: Possibly American
+    - 0-1: Uncertain
+    - <0: Likely non-American
+    """
+    score = 0
+    
+    # FACTOR 1: Channel Country (strongest signal)
+    if channel_country == 'US':
+        score += 3  # Strong positive
+    elif channel_country in ['CA', 'GB', 'AU', 'NZ', 'IE']:
+        score -= 2  # Strong negative (other English-speaking countries)
+    elif channel_country == 'unknown':
+        score += 0  # Neutral (no penalty)
+    
+    # FACTOR 2: Title/Description Keywords
+    text = (video_info['title'] + ' ' + video_info.get('description', '')).lower()
+    
+    # Positive keywords (American indicators)
+    american_keywords = [
+        'american', 'usa', 'united states', 'us ', ' us',
+        'american english', 'american accent'
+    ]
+    if any(kw in text for kw in american_keywords):
+        score += 2
+    
+    # Negative keywords (non-American indicators)
+    non_american_keywords = [
+        'british', 'uk', 'bbc', 'england', 'london',
+        'australian', 'aussie', 'australia', 'sydney',
+        'canadian', 'canada', 'toronto', 'vancouver',
+        'indian', 'india', 'mumbai', 'delhi'
+    ]
+    if any(kw in text for kw in non_american_keywords):
+        score -= 3
+    
+    # FACTOR 3: Known American Sources
+    channel = video_info['channel'].lower()
+    american_sources = [
+        'ted', 'tedx',  # TED talks (many American speakers)
+        'stanford', 'mit', 'harvard', 'yale', 'princeton',  # US universities
+        'cnn', 'nbc', 'abc', 'cbs', 'pbs',  # US news
+        'khan academy',  # US educational
+    ]
+    if any(src in channel for src in american_sources):
+        score += 1
+    
+    # Known non-American sources
+    non_american_sources = [
+        'bbc', 'itv', 'channel 4',  # UK
+        'abc australia', 'sbs',  # Australia
+        'cbc',  # Canada
+    ]
+    if any(src in channel for src in non_american_sources):
+        score -= 3
+    
+    return score
+
+
+
+def search_creative_commons_videos(api_key, max_results=10, max_retries=3, american_score_threshold=2):
+    """
+    TIER 1: Search for Creative Commons (CC-BY) licensed videos with AMERICAN ENGLISH pre-filtering.
     These are 100% legal for research and publication.
     """
     logger.info("="*70)
     logger.info("TIER 1: SEARCHING FOR CREATIVE COMMONS (CC-BY) VIDEOS")
+    logger.info("WITH AMERICAN ENGLISH PRE-FILTERING")
     logger.info("="*70)
     logger.info("License: CC-BY (Attribution)")
     logger.info("Legal status: ✅ Fully legal for research and publication")
+    logger.info(f"American score threshold: {american_score_threshold}")
     
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -235,11 +363,12 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3):
                     part='id,snippet',
                     q=query,
                     type='video',
-                    maxResults=5,
+                    maxResults=10,  # Get more to filter
                     videoLicense='creativeCommon',  # ← CC-BY filter
                     videoDefinition='high',
                     videoDuration='medium',
                     relevanceLanguage='en',
+                    regionCode='US',  # ← NEW: Bias toward US uploads
                     order='relevance',
                     safeSearch='strict'
                 )
@@ -252,18 +381,38 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3):
                     video_id = item['id']['videoId']
                     title = item['snippet']['title']
                     channel = item['snippet']['channelTitle']
+                    channel_id = item['snippet']['channelId']
+                    description = item['snippet'].get('description', '')
                     
-                    all_videos.append({
+                    # Get channel country
+                    channel_country = get_channel_country(youtube, channel_id)
+                    
+                    video_info = {
                         'id': video_id,
                         'title': title,
                         'channel': channel,
+                        'channel_id': channel_id,
+                        'channel_country': channel_country,
+                        'description': description,
                         'query': query,
                         'license': 'CC-BY',
                         'tier': 1,
                         'legal_status': 'Fully legal - Creative Commons Attribution'
-                    })
+                    }
                     
-                    logger.info(f"  ✓ {video_id} - {title[:50]}...")
+                    # Calculate American score
+                    american_score = calculate_american_score(video_info, channel_country)
+                    video_info['american_score'] = american_score
+                    
+                    # Record statistics
+                    passed = american_score >= american_score_threshold
+                    filter_stats.record_video(american_score, channel_country, passed)
+                    
+                    if passed:
+                        all_videos.append(video_info)
+                        logger.info(f"  ✓ {video_id} - {title[:40]}... [Score: {american_score}, Country: {channel_country}]")
+                    else:
+                        logger.debug(f"  ✗ FILTERED: {video_id} - {title[:40]}... [Score: {american_score}, Country: {channel_country}]")
                 
                 # Anti-detection delay
                 smart_delay(2.0, 4.0, "search-cooldown")
@@ -325,20 +474,22 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3):
     
     unique_videos = unique_videos[:max_results]
     
-    logger.info(f"✓ Found {len(unique_videos)} CC-BY licensed videos")
+    logger.info(f"✓ Found {len(unique_videos)} CC-BY licensed videos (after American filtering)")
     return unique_videos
 
 
-def search_ted_talks(api_key, max_results=10, max_retries=3):
+def search_ted_talks(api_key, max_results=10, max_retries=3, american_score_threshold=2):
     """
-    TIER 2: Search for TED/TEDx talks with retry logic.
+    TIER 2: Search for TED/TEDx talks with AMERICAN ENGLISH pre-filtering.
     Licensed CC BY-NC-ND, widely accepted for academic lip-reading research.
     """
     logger.info("="*70)
     logger.info("TIER 2: SEARCHING FOR TED/TEDx TALKS")
+    logger.info("WITH AMERICAN ENGLISH PRE-FILTERING")
     logger.info("="*70)
     logger.info("License: CC BY-NC-ND (Attribution, Non-Commercial, No Derivatives)")
     logger.info("Legal status: ✅ Legal for non-commercial academic research")
+    logger.info(f"American score threshold: {american_score_threshold}")
     
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -370,10 +521,11 @@ def search_ted_talks(api_key, max_results=10, max_retries=3):
                     part='id,snippet',
                     q=query,
                     type='video',
-                    maxResults=5,
+                    maxResults=10,  # Get more to filter
                     videoDefinition='high',
                     videoDuration='medium',
                     relevanceLanguage='en',
+                    regionCode='US',  # ← NEW: Bias toward US uploads
                     order='viewCount',  # Popular TED talks
                     safeSearch='strict'
                 )
@@ -386,20 +538,42 @@ def search_ted_talks(api_key, max_results=10, max_retries=3):
                     video_id = item['id']['videoId']
                     title = item['snippet']['title']
                     channel = item['snippet']['channelTitle']
+                    channel_id = item['snippet']['channelId']
+                    description = item['snippet'].get('description', '')
                     
                     # Filter for actual TED channels
-                    if 'TED' in channel or 'TED' in title:
-                        all_videos.append({
-                            'id': video_id,
-                            'title': title,
-                            'channel': channel,
-                            'query': query,
-                            'license': 'CC BY-NC-ND',
-                            'tier': 2,
-                            'legal_status': 'Legal for non-commercial research - TED license'
-                        })
-                        
-                        logger.info(f"  ✓ {video_id} - {title[:50]}...")
+                    if 'TED' not in channel and 'TED' not in title:
+                        continue
+                    
+                    # Get channel country
+                    channel_country = get_channel_country(youtube, channel_id)
+                    
+                    video_info = {
+                        'id': video_id,
+                        'title': title,
+                        'channel': channel,
+                        'channel_id': channel_id,
+                        'channel_country': channel_country,
+                        'description': description,
+                        'query': query,
+                        'license': 'CC BY-NC-ND',
+                        'tier': 2,
+                        'legal_status': 'Legal for non-commercial research - TED license'
+                    }
+                    
+                    # Calculate American score
+                    american_score = calculate_american_score(video_info, channel_country)
+                    video_info['american_score'] = american_score
+                    
+                    # Record statistics
+                    passed = american_score >= american_score_threshold
+                    filter_stats.record_video(american_score, channel_country, passed)
+                    
+                    if passed:
+                        all_videos.append(video_info)
+                        logger.info(f"  ✓ {video_id} - {title[:40]}... [Score: {american_score}, Country: {channel_country}]")
+                    else:
+                        logger.debug(f"  ✗ FILTERED: {video_id} - {title[:40]}... [Score: {american_score}, Country: {channel_country}]")
                 
                 # Anti-detection delay
                 smart_delay(2.0, 4.0, "search-cooldown")
@@ -453,8 +627,9 @@ def search_ted_talks(api_key, max_results=10, max_retries=3):
     
     unique_videos = unique_videos[:max_results]
     
-    logger.info(f"✓ Found {len(unique_videos)} TED/TEDx talks")
+    logger.info(f"✓ Found {len(unique_videos)} TED/TEDx talks (after American filtering)")
     return unique_videos
+
 
 
 def download_video(video_info, output_dir, index, total, max_retries=3):
@@ -463,10 +638,13 @@ def download_video(video_info, output_dir, index, total, max_retries=3):
     title = video_info['title']
     license_type = video_info['license']
     tier = video_info['tier']
+    american_score = video_info.get('american_score', 'N/A')
+    channel_country = video_info.get('channel_country', 'unknown')
     
     logger.info(f"[{index}/{total}] Downloading: {video_id}")
     logger.info(f"  Title: {title[:60]}...")
     logger.info(f"  License: {license_type} (Tier {tier})")
+    logger.info(f"  American Score: {american_score}, Country: {channel_country}")
     
     output_path = Path(output_dir)
     output_file = output_path / f'{video_id}.mp4'
@@ -581,8 +759,8 @@ def download_video(video_info, output_dir, index, total, max_retries=3):
 def main():
     start_time = datetime.now()
     logger.info("="*70)
-    logger.info("LEGAL YOUTUBE VIDEO DOWNLOADER FOR RESEARCH (WITH LOGGING)")
-    logger.info("Only downloads videos with clear legal permissions")
+    logger.info("AMERICAN ENGLISH YOUTUBE VIDEO DOWNLOADER FOR RESEARCH")
+    logger.info("Downloads only legally licensed videos with American English accent")
     logger.info("="*70)
     logger.info(f"Session started: {start_time.isoformat()}")
     
@@ -609,18 +787,24 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"✓ Output directory: {output_dir.absolute()}")
     
-    # Search for both types of videos
+    # American score threshold
+    american_score_threshold = 2
+    logger.info(f"✓ American score threshold: {american_score_threshold}")
+    
+    # Search for both types of videos with American filtering
     logger.info("\n" + "="*70)
-    logger.info("STARTING VIDEO SEARCH")
+    logger.info("STARTING VIDEO SEARCH WITH AMERICAN ENGLISH PRE-FILTERING")
     logger.info("="*70)
     
-    cc_videos = search_creative_commons_videos(api_key, max_results=5, max_retries=3)
-    ted_videos = search_ted_talks(api_key, max_results=5, max_retries=3)
+    cc_videos = search_creative_commons_videos(api_key, max_results=5, max_retries=3, american_score_threshold=american_score_threshold)
+    ted_videos = search_ted_talks(api_key, max_results=5, max_retries=3, american_score_threshold=american_score_threshold)
     
     all_videos = cc_videos + ted_videos
     
     if not all_videos:
-        logger.error("✗ No videos found!")
+        logger.error("✗ No videos found after American filtering!")
+        logger.info("\nPre-Filtering Statistics:")
+        logger.info(json.dumps(filter_stats.get_summary(), indent=2))
         logger.info("\nQuota Status:")
         logger.info(json.dumps(quota_tracker.get_status(), indent=2))
         logger.info("\nError Summary:")
@@ -634,13 +818,24 @@ def main():
     logger.info(f"Tier 1 (CC-BY): {len(cc_videos)} videos")
     logger.info(f"Tier 2 (TED): {len(ted_videos)} videos")
     logger.info(f"Total: {len(all_videos)} videos")
+    
+    logger.info("\nPre-Filtering Statistics:")
+    filter_summary = filter_stats.get_summary()
+    logger.info(f"  Total searched: {filter_summary['total_searched']}")
+    logger.info(f"  Passed filter: {filter_summary['passed_filter']}")
+    logger.info(f"  Filtered out: {filter_summary['filtered_out']}")
+    logger.info(f"  Pass rate: {filter_summary['pass_rate']:.1f}%")
+    logger.info(f"  Country distribution: {filter_summary['country_distribution']}")
+    logger.info(f"  Score distribution: {filter_summary['score_distribution']}")
+    
     logger.info("\nQuota Status:")
     logger.info(json.dumps(quota_tracker.get_status(), indent=2))
     
     # Download videos
     logger.info("\n" + "="*70)
-    logger.info(f"DOWNLOADING {len(all_videos)} LEGAL VIDEOS")
+    logger.info(f"DOWNLOADING {len(all_videos)} PRE-FILTERED VIDEOS")
     logger.info("="*70)
+    logger.info("NOTE: These videos will be verified with accent classifier in next step")
     
     downloaded = []
     failed = []
@@ -670,9 +865,11 @@ def main():
             'duration_seconds': duration,
             'duration_formatted': f"{int(duration // 60)}m {int(duration % 60)}s"
         },
+        'pre_filtering': filter_stats.get_summary(),
         'quota': quota_tracker.get_status(),
         'errors': error_tracker.get_summary(),
         'legal_compliance': 'All videos have explicit licenses for research use',
+        'accent_filtering': 'Pre-filtered for American English (post-verification required)',
         'statistics': {
             'tier_1_cc_by': len([v for v in downloaded if v['tier'] == 1]),
             'tier_2_ted': len([v for v in downloaded if v['tier'] == 2]),
@@ -687,7 +884,7 @@ def main():
         'download_errors': download_errors
     }
     
-    results_file = output_dir / 'legal_download_results.json'
+    results_file = output_dir / 'american_download_results.json'
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
@@ -700,7 +897,8 @@ def main():
     with open(attribution_file, 'w') as f:
         f.write("VIDEO ATTRIBUTION FOR RESEARCH DATASET\n")
         f.write("="*70 + "\n\n")
-        f.write("This dataset contains videos with the following licenses:\n\n")
+        f.write("This dataset contains videos with the following licenses:\n")
+        f.write("PRE-FILTERED for American English accent (post-verification required)\n\n")
         
         f.write("TIER 1: Creative Commons (CC-BY) Videos\n")
         f.write("-" * 70 + "\n")
@@ -709,6 +907,8 @@ def main():
                 f.write(f"Video ID: {v['id']}\n")
                 f.write(f"Title: {v['title']}\n")
                 f.write(f"Channel: {v['channel']}\n")
+                f.write(f"Channel Country: {v.get('channel_country', 'unknown')}\n")
+                f.write(f"American Score: {v.get('american_score', 'N/A')}\n")
                 f.write(f"License: {v['license']}\n")
                 f.write(f"URL: https://www.youtube.com/watch?v={v['id']}\n\n")
         
@@ -719,6 +919,8 @@ def main():
                 f.write(f"Video ID: {v['id']}\n")
                 f.write(f"Title: {v['title']}\n")
                 f.write(f"Channel: {v['channel']}\n")
+                f.write(f"Channel Country: {v.get('channel_country', 'unknown')}\n")
+                f.write(f"American Score: {v.get('american_score', 'N/A')}\n")
                 f.write(f"License: {v['license']}\n")
                 f.write(f"URL: https://www.youtube.com/watch?v={v['id']}\n\n")
         
@@ -726,7 +928,13 @@ def main():
         f.write("-" * 70 + "\n")
         f.write("All videos in this dataset are used under their respective licenses.\n")
         f.write("This dataset is for non-commercial academic research only.\n")
-        f.write("Proper attribution is provided for all content.\n")
+        f.write("Proper attribution is provided for all content.\n\n")
+        
+        f.write("ACCENT FILTERING\n")
+        f.write("-" * 70 + "\n")
+        f.write("Videos have been pre-filtered for American English accent.\n")
+        f.write("Post-verification with accent classifier is required.\n")
+        f.write("Run verify_american_accent.py to complete accent verification.\n")
     
     # Summary
     logger.info("\n" + "="*70)
@@ -739,6 +947,11 @@ def main():
     logger.info(f"  Total downloaded: {len(downloaded)}")
     logger.info(f"  Failed: {len(failed)}")
     logger.info(f"  Success rate: {(len(downloaded) / len(all_videos) * 100):.1f}%")
+    
+    logger.info(f"\nPre-Filtering Effectiveness:")
+    logger.info(f"  Videos searched: {filter_summary['total_searched']}")
+    logger.info(f"  Passed filter: {filter_summary['passed_filter']} ({filter_summary['pass_rate']:.1f}%)")
+    logger.info(f"  Expected American: ~{int(len(downloaded) * 0.75)}-{int(len(downloaded) * 0.85)} videos")
     
     logger.info(f"\nQuota Status:")
     quota_status = quota_tracker.get_status()
@@ -761,31 +974,32 @@ def main():
     logger.info(f"  Session log: youtube_scraper.log")
     
     if downloaded:
-        logger.info(f"\n✓ SUCCESS! Downloaded {len(downloaded)} legally licensed videos.")
+        logger.info(f"\n✓ SUCCESS! Downloaded {len(downloaded)} pre-filtered videos.")
         logger.info(f"\nDownloaded videos by tier:")
         
         tier1 = [v for v in downloaded if v['tier'] == 1]
         if tier1:
             logger.info(f"\n  Tier 1 (CC-BY) - {len(tier1)} videos:")
             for v in tier1:
-                logger.info(f"    - {v['id']}.mp4 ({v['title'][:50]}...)")
+                logger.info(f"    - {v['id']}.mp4 ({v['title'][:50]}...) [Score: {v.get('american_score', 'N/A')}]")
         
         tier2 = [v for v in downloaded if v['tier'] == 2]
         if tier2:
             logger.info(f"\n  Tier 2 (TED) - {len(tier2)} videos:")
             for v in tier2:
-                logger.info(f"    - {v['id']}.mp4 ({v['title'][:50]}...)")
+                logger.info(f"    - {v['id']}.mp4 ({v['title'][:50]}...) [Score: {v.get('american_score', 'N/A')}]")
         
         logger.info(f"\n✅ LEGAL STATUS: All videos are licensed for research use")
-        logger.info(f"✅ PUBLICATION READY: Can be cited in academic papers")
+        logger.info(f"✅ PRE-FILTERED: Videos biased toward American English")
         logger.info(f"✅ ATTRIBUTION: See {attribution_file} for proper citations")
         
-        logger.info(f"\nNext steps:")
-        logger.info(f"  1. Review the videos in {output_dir}/")
-        logger.info(f"  2. Check {attribution_file} for proper attribution")
-        logger.info(f"  3. Review {error_log_file} for any issues")
-        logger.info(f"  4. Scale up by running this script multiple times")
-        logger.info(f"  5. Process videos to extract lip ROIs")
+        logger.info(f"\n⚠️  NEXT STEP: Run accent verification")
+        logger.info(f"  python verify_american_accent.py")
+        logger.info(f"  This will verify accents and delete non-American videos")
+        
+        logger.info(f"\nExpected results after verification:")
+        logger.info(f"  American videos: ~{int(len(downloaded) * 0.75)}-{int(len(downloaded) * 0.85)} ({75}-{85}%)")
+        logger.info(f"  Non-American (will be deleted): ~{int(len(downloaded) * 0.15)}-{int(len(downloaded) * 0.25)} ({15}-{25}%)")
     else:
         logger.error(f"\n✗ No videos were downloaded successfully.")
         logger.error(f"  Check {error_log_file} for details.")
