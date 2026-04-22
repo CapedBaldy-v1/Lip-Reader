@@ -237,31 +237,21 @@ lrs3_download/
 lrs2_download/
 
 # Training results
+# Training results
 training_results*.json
 split_info.json
 preprocessing_metadata.json
 all_transcripts.json
 
-# Handoff and personal notes (specific files to ignore)
-HANDOFF.md
-NOTES.md
-TODO.md
+# Ignore ALL .md files except README.md
+*.md
+!README.md
+
+# Handoff and personal notes
 SCRAPER_DELIVERY_SUMMARY.txt
 YOUTUBE_API_SIMPLE_GUIDE.txt
-
-# Temporary status and planning files
-CLEANUP_SUMMARY.md
-GITIGNORE_UPDATED.md
-LEGAL_DATASET_READY.md
-PREPROCESSING_COMPLETE.md
-TEST_DOWNLOAD_SUCCESS.md
-TRAINING_RESULTS_ANALYSIS.md
-WORD_ALIGNMENT_COMPLETE.md
-YOUTUBE_SCRAPER_COMPLETE.md
-YOUTUBE_DATASET_PLAN.md
-ACTION_PLAN_LEGAL_COMPLIANT.md
-WHAT_TO_DO_NEXT.md
-study_design.md
+NOTES.md
+TODO.md
 
 # Test outputs
 test_output/
