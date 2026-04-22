@@ -63,16 +63,16 @@ LOGGER = setup_logging("training")
 class TrainingConfig:
     """Training hyperparameters."""
 
-    # Basic training
-    batch_size: int = 32
+    # Basic training - OPTIMIZED FOR SMALL DATASETS
+    batch_size: int = 4  # REDUCED from 32 for small datasets
     epochs: int = 50
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-5  # REDUCED from 1e-4 for better convergence
     weight_decay: float = 0.01
     warmup_epochs: int = 5
 
     # Gradient settings
     gradient_clip: float = 1.0
-    accumulation_steps: int = 1
+    accumulation_steps: int = 8  # INCREASED to simulate larger batch (effective batch = 4*8=32)
 
     # Curriculum learning
     curriculum_phases: Tuple[int, int] = (5, 20)
@@ -99,6 +99,13 @@ class TrainingConfig:
 
     # Attention sink mitigation (paper-4+ inspired)
     attention_entropy_weight: float = 0.01
+    
+    # NEW: Label smoothing for better generalization
+    label_smoothing: float = 0.1
+    
+    # NEW: Use beam search by default
+    use_beam_search: bool = True
+    beam_width: int = 10
 
 
 # =============================================================================
@@ -107,15 +114,16 @@ class TrainingConfig:
 
 class CTCLossWrapper(nn.Module):
     """
-    CTC Loss wrapper that handles label preparation.
+    CTC Loss wrapper that handles label preparation with optional label smoothing.
     """
 
-    def __init__(self, blank_idx: int = 39):
+    def __init__(self, blank_idx: int = 39, label_smoothing: float = 0.0):
         super().__init__()
         self.ctc_loss = nn.CTCLoss(blank=blank_idx, reduction='mean', zero_infinity=True)
         self.phoneme_vocab = get_phoneme_vocab()
         self.phoneme_to_idx = {p: i for i, p in enumerate(self.phoneme_vocab)}
         self.blank_idx = blank_idx
+        self.label_smoothing = label_smoothing
 
     def text_to_targets(self, texts: list) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -154,7 +162,7 @@ class CTCLossWrapper(nn.Module):
         input_lengths: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute CTC loss.
+        Compute CTC loss with optional label smoothing.
 
         Args:
             log_probs: Log probabilities from model (B, T, C)
@@ -173,9 +181,17 @@ class CTCLossWrapper(nn.Module):
         if input_lengths is None:
             input_lengths = torch.full((batch_size,), time_steps, dtype=torch.long, device=log_probs.device)
 
-        log_probs = log_probs.permute(1, 0, 2)
+        log_probs_ctc = log_probs.permute(1, 0, 2)
 
-        loss = self.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+        # Standard CTC loss
+        ctc_loss = self.ctc_loss(log_probs_ctc, targets, input_lengths, target_lengths)
+        
+        # Label smoothing: encourage uniform distribution
+        if self.label_smoothing > 0:
+            smooth_loss = -log_probs.mean()
+            loss = (1 - self.label_smoothing) * ctc_loss + self.label_smoothing * smooth_loss
+        else:
+            loss = ctc_loss
 
         LOGGER.debug("CTC loss computed: %f", loss.item())
         return loss
@@ -256,12 +272,28 @@ class Trainer:
         self.config = config
         self.device = device
 
-        self.ctc_loss = CTCLossWrapper()
+        self.ctc_loss = CTCLossWrapper(label_smoothing=config.label_smoothing)
+
+        # IMPROVED: Differential learning rates for different components
+        param_groups = [
+            {'params': model.visual_encoder.parameters(), 'lr': config.learning_rate * 0.3},  # Lower LR for encoder
+            {'params': model.temporal_adapter.parameters(), 'lr': config.learning_rate * 0.5},
+            {'params': model.phoneme_head.parameters(), 'lr': config.learning_rate},  # Higher LR for head
+        ]
+        
+        # Add temporal attention if it exists
+        if hasattr(model, 'temporal_attention') and model.temporal_attention is not None:
+            param_groups.append({'params': model.temporal_attention.parameters(), 'lr': config.learning_rate * 0.5})
+        
+        # Add temporal multiscale if it exists
+        if hasattr(model, 'temporal_multiscale') and model.temporal_multiscale is not None:
+            param_groups.append({'params': model.temporal_multiscale.parameters(), 'lr': config.learning_rate * 0.5})
 
         self.optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
+            param_groups,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.98),  # IMPROVED: Better betas for transformers
+            eps=1e-6
         )
 
         self.scheduler = CosineAnnealingLR(

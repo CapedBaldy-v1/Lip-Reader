@@ -1333,6 +1333,7 @@ class LipReadingDataset(Dataset):
         self.transform = transform
         self.phase = phase
         self._epoch = 0
+        self._training = False  # CRITICAL FIX: Initialize training mode
 
         self.samples = self._load_samples()
         self.samples = self._filter_by_phase(self.samples)
@@ -1774,6 +1775,28 @@ class LipReadingDataset(Dataset):
                 replaced[idx] = replaced[min(1, num_frames - 1)]
         return replaced
 
+    def _maybe_spec_augment(self, video: np.ndarray, scale: float) -> np.ndarray:
+        """SpecAugment-style frequency and time masking for visual speech."""
+        if scale <= 0 or np.random.random() >= 0.3 * scale:
+            return video
+        
+        # Time masking (mask consecutive frames)
+        if np.random.random() < 0.5:
+            mask_len = np.random.randint(1, min(8, max(2, video.shape[0] // 4)))
+            start = np.random.randint(0, max(1, video.shape[0] - mask_len + 1))
+            video[start:start + mask_len] = 0
+        
+        # Spatial masking (mask patches in mouth region)
+        if np.random.random() < 0.5:
+            h, w = video.shape[1:3]
+            mask_h = np.random.randint(max(1, h // 8), max(2, h // 4))
+            mask_w = np.random.randint(max(1, w // 8), max(2, w // 4))
+            start_h = np.random.randint(0, max(1, h - mask_h + 1))
+            start_w = np.random.randint(0, max(1, w - mask_w + 1))
+            video[:, start_h:start_h + mask_h, start_w:start_w + mask_w] = 0
+        
+        return video
+
     def _augment(self, video: np.ndarray) -> np.ndarray:
         """Apply data augmentation."""
         if not self.training:
@@ -1794,6 +1817,7 @@ class LipReadingDataset(Dataset):
         video = self._maybe_beard_occlusion(video, scale)
         video = self._maybe_black_bar(video, scale)
         video = self._maybe_temporal_mask(video, scale)
+        video = self._maybe_spec_augment(video, scale)  # NEW: SpecAugment
 
         return np.clip(video, -3, 3)
 
