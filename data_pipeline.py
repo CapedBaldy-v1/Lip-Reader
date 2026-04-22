@@ -43,26 +43,36 @@ LOGGER = setup_logging("data_pipeline")
 
 try:
     import mediapipe as mp
-    if not hasattr(mp, "solutions"):
-        try:
-            import mediapipe.solutions as mp_solutions
-            mp.solutions = mp_solutions
-        except Exception:
-            try:
-                import mediapipe.python.solutions as mp_solutions
-                mp.solutions = mp_solutions
-            except Exception as exc:
-                MEDIAPIPE_AVAILABLE = False
-                print("[DataPipeline] MediaPipe solutions unavailable - lip extraction disabled")
-                LOGGER.warning("MediaPipe solutions unavailable: %s", exc)
-            else:
-                MEDIAPIPE_AVAILABLE = True
-        else:
-            MEDIAPIPE_AVAILABLE = True
-    else:
+    # Try old API first (mp.solutions)
+    if hasattr(mp, "solutions"):
         MEDIAPIPE_AVAILABLE = True
+        MEDIAPIPE_NEW_API = False
+    else:
+        # Try new API (mp.tasks)
+        try:
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+            # Create compatibility wrapper
+            class _SolutionsCompat:
+                class face_mesh:
+                    @staticmethod
+                    def FaceMesh(*args, **kwargs):
+                        # Wrapper will be created in MediaPipeProcessor
+                        return None
+            mp.solutions = _SolutionsCompat()
+            mp._tasks_python = mp_python
+            mp._tasks_vision = mp_vision
+            MEDIAPIPE_AVAILABLE = True
+            MEDIAPIPE_NEW_API = True
+            print("[DataPipeline] Using new MediaPipe tasks API (0.10+)")
+        except Exception as exc:
+            MEDIAPIPE_AVAILABLE = False
+            MEDIAPIPE_NEW_API = False
+            print("[DataPipeline] MediaPipe not available - lip extraction disabled")
+            LOGGER.warning("MediaPipe not available: %s", exc)
 except Exception as exc:
     MEDIAPIPE_AVAILABLE = False
+    MEDIAPIPE_NEW_API = False
     print("[DataPipeline] MediaPipe not available - lip extraction disabled")
     LOGGER.warning("MediaPipe not available - lip extraction disabled. %s", exc)
 
@@ -263,14 +273,80 @@ class MediaPipeProcessor:
 
     def _create_face_mesh(self) -> None:
         """Initialize the MediaPipe Face Mesh model."""
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=self.max_faces,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        global MEDIAPIPE_NEW_API
+        
+        if hasattr(mp, '_tasks_vision'):
+            # New API (MediaPipe 0.10+)
+            import tempfile
+            import urllib.request
+            
+            # Download face landmarker model
+            model_path = Path(tempfile.gettempdir()) / 'face_landmarker.task'
+            if not model_path.exists():
+                print("[MediaPipe] Downloading face landmarker model...")
+                model_url = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+                urllib.request.urlretrieve(model_url, model_path)
+                print(f"[MediaPipe] Model downloaded to {model_path}")
+            
+            # Create FaceLandmarker
+            BaseOptions = mp._tasks_python.BaseOptions
+            FaceLandmarker = mp._tasks_vision.FaceLandmarker
+            FaceLandmarkerOptions = mp._tasks_vision.FaceLandmarkerOptions
+            VisionRunningMode = mp._tasks_vision.RunningMode
+            
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(model_path)),
+                running_mode=VisionRunningMode.VIDEO,
+                num_faces=self.max_faces,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False
+            )
+            
+            self.face_mesh = FaceLandmarker.create_from_options(options)
+            self.mp_face_mesh = None
+            self._new_api = True
+            self._frame_timestamp_ms = 0
+        else:
+            # Old API (MediaPipe < 0.10)
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=self.max_faces,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self._new_api = False
+    
+    def _process_frame(self, rgb_frame: np.ndarray):
+        """Process frame with MediaPipe (handles both old and new API)."""
+        if self._new_api:
+            # New API requires mp.Image
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            self._frame_timestamp_ms += 33  # ~30fps
+            result = self.face_mesh.detect_for_video(mp_image, self._frame_timestamp_ms)
+            
+            # Convert to old API format
+            class FakeLandmarks:
+                def __init__(self, landmarks):
+                    self.landmark = landmarks
+            
+            class FakeResults:
+                def __init__(self):
+                    self.multi_face_landmarks = []
+            
+            fake_results = FakeResults()
+            if result.face_landmarks:
+                for face_landmarks in result.face_landmarks:
+                    fake_results.multi_face_landmarks.append(FakeLandmarks(face_landmarks))
+            
+            return fake_results
+        else:
+            # Old API
+            return self._process_frame(rgb_frame)
 
     def _init_kalman_filter(self):
         """Initialize Kalman filter for mouth center tracking."""
@@ -382,7 +458,7 @@ class MediaPipeProcessor:
         """Extract lip center, size, and mouth angle for a frame."""
         height, width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        results = self._process_frame(rgb_frame)
 
         if not results.multi_face_landmarks:
             return None
@@ -406,7 +482,7 @@ class MediaPipeProcessor:
         """Extract lip metrics for visual-only filtering."""
         height, width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        results = self._process_frame(rgb_frame)
 
         if not results.multi_face_landmarks:
             return None
@@ -418,7 +494,7 @@ class MediaPipeProcessor:
         """Extract lip metrics for all detected faces."""
         height, width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        results = self._process_frame(rgb_frame)
 
         if not results.multi_face_landmarks:
             return []
@@ -432,7 +508,7 @@ class MediaPipeProcessor:
         """Extract lip metrics and landmarks for all detected faces."""
         height, width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        results = self._process_frame(rgb_frame)
 
         if not results.multi_face_landmarks:
             return []
@@ -623,7 +699,7 @@ class MediaPipeProcessor:
         height, width = frame.shape[:2]
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        results = self._process_frame(rgb_frame)
 
         if not results.multi_face_landmarks:
             return None

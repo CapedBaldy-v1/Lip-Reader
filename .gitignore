@@ -1,38 +1,294 @@
-# Python caches
+# ============================================
+# API KEYS AND SECRETS - NEVER COMMIT THESE!
+# ============================================
+# YouTube API key
+.youtube_api_key
+youtube_api_key.txt
+*api_key*.txt
+*API_KEY*.txt
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# API configuration files
+api_config.json
+secrets.json
+credentials.json
+
+# Any file with "secret" or "key" in name
+*secret*
+*SECRET*
+*key.json
+*KEY.json
+
+# ============================================
+# PYTHON
+# ============================================
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Virtual environments
 .venv/
 .venv-*/
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
 
-# Logs and artifacts
-logs/
-artifacts/
+# PyInstaller
+*.manifest
+*.spec
 
-# Checkpoints and outputs
-checkpoints/
-*.ckpt
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pyenv
+.python-version
+
+# ============================================
+# MACHINE LEARNING / AI
+# ============================================
+# Model weights and checkpoints
 *.pt
 *.pth
+*.ckpt
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.safetensors
+checkpoints/
+models/
+weights/
+best_model*.pt
+checkpoint_*.pt
 
-# Datasets and generated data
+# Training outputs
+runs/
+logs/
+tensorboard/
+wandb/
+mlruns/
+
+# ============================================
+# DATA FILES
+# ============================================
+# Raw videos
+youtube_raw_downloads/
+youtube_dataset/
+youtube_dataset_test/
+videos/
+raw_videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+
+# Preprocessed data
+preprocessed_data/
+processed/
+lip_rois/
+*.npy
+*.npz
+
+# Training datasets
+dataset/
+dataset_*/
 data/
 datasets/
-videos/
-labels/
-*.npy
-lrs3_download/
+train/
+val/
+test/
 
-# Research papers
-other research papers/
+# Transcripts (keep scripts, ignore generated data)
+transcripts/
+transcripts_word_level/
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Images (except documentation images)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+!docs/**/*.png
+!docs/**/*.jpg
+!README_images/*.png
+
+# ============================================
+# YOUTUBE SCRAPER DATA
+# ============================================
+youtube_scraper/data/
+*trainability_cache.json
+*video_candidates.json
+*download_results.json
+*legal_download_results.json
+ATTRIBUTION.txt
+
+# ============================================
+# LOGS AND TEMPORARY FILES
+# ============================================
+# Logs
+*.log
+logs/
+artifacts/
+training_log.txt
 
 # Temporary files
+temp/
+tmp/
+*.tmp
 temp_video.mp4
+*.swp
+*.swo
+*~
 
-# Local handoff doc
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ============================================
+# IDE / EDITOR
+# ============================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*.swn
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================
+# PROJECT SPECIFIC
+# ============================================
+# Research papers (too large for git)
+other research papers/
+papers/
+*.pdf
+
+# LRS3 dataset download
+lrs3_download/
+lrs2_download/
+
+# Training results
+training_results*.json
+split_info.json
+preprocessing_metadata.json
+all_transcripts.json
+
+# Handoff and personal notes (specific files to ignore)
 HANDOFF.md
+NOTES.md
+TODO.md
+SCRAPER_DELIVERY_SUMMARY.txt
+YOUTUBE_API_SIMPLE_GUIDE.txt
+
+# Temporary status and planning files
+CLEANUP_SUMMARY.md
+GITIGNORE_UPDATED.md
+LEGAL_DATASET_READY.md
+PREPROCESSING_COMPLETE.md
+TEST_DOWNLOAD_SUCCESS.md
+TRAINING_RESULTS_ANALYSIS.md
+WORD_ALIGNMENT_COMPLETE.md
+YOUTUBE_SCRAPER_COMPLETE.md
+YOUTUBE_DATASET_PLAN.md
+ACTION_PLAN_LEGAL_COMPLIANT.md
+WHAT_TO_DO_NEXT.md
+study_design.md
+
+# Test outputs
+test_output/
+debug/
+scratch/
+
+# Dataset creation web files (downloaded HTML/JS/CSS)
+dataset creation/
+*_files/
+*.html
+*.htm
+*.css
+*.js
+*.svg
+!*.py  # Keep Python files
+
+# ============================================
+# KEEP THESE (explicitly not ignored)
+# ============================================
+# Keep example files
+!.youtube_api_key.example
+!example_*.py
+
+# Keep documentation
+!README.md
+!docs/
+
+# Keep configuration examples
+!config.example.json
+!.env.example
