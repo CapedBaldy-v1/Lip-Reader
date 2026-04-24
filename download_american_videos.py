@@ -332,13 +332,35 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3, ameri
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     
-    # Good queries for lip-reading with CC content
-    queries = [
-        "interview speech",
-        "public speaking tutorial",
-        "educational lecture",
-        "presentation skills",
+    # Load pagination state
+    pagination_file = Path('pagination_state.json')
+    if pagination_file.exists():
+        with open(pagination_file, 'r') as f:
+            pagination_state = json.load(f)
+    else:
+        pagination_state = {'cc_page_token': None, 'ted_page_token': None, 'query_index': 0, 'session_count': 0}
+    
+    # Expanded queries for diversity - rotate through them
+    all_queries = [
+        "interview speech", "public speaking tutorial", "educational lecture", "presentation skills",
+        "communication skills", "speech training", "debate competition", "conference talk",
+        "seminar presentation", "business presentation", "academic lecture", "keynote speech",
+        "panel discussion", "workshop training", "professional development", "leadership talk",
+        "motivational speech", "corporate training", "sales presentation", "marketing talk",
+        "technology presentation", "startup pitch", "investor presentation", "product demo",
+        "tutorial video", "how to speak", "public speaking tips", "presentation techniques",
+        "communication workshop", "speaking skills", "voice training", "speech coaching"
     ]
+    
+    # Use different queries each session
+    start_index = pagination_state.get('query_index', 0) % len(all_queries)
+    queries = all_queries[start_index:start_index+4]  # Use 4 queries per session
+    
+    # Update pagination state
+    pagination_state['query_index'] = (start_index + 4) % len(all_queries)
+    pagination_state['session_count'] = pagination_state.get('session_count', 0) + 1
+    
+    logger.info(f"Session {pagination_state['session_count']}: Using queries {start_index}-{start_index+3}")
     
     all_videos = []
     youtube = build('youtube', 'v3', developerKey=api_key)
@@ -359,23 +381,34 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3, ameri
         
         while attempt < max_retries and not success:
             try:
+                # Add randomization to get different results
+                order_options = ['relevance', 'date', 'viewCount', 'rating']
+                random_order = random.choice(order_options)
+                
                 request = youtube.search().list(
                     part='id,snippet',
                     q=query,
                     type='video',
-                    maxResults=10,  # Get more to filter
+                    maxResults=15,  # Get more to filter (increased from 10)
                     videoLicense='creativeCommon',  # ← CC-BY filter
                     videoDefinition='high',
                     videoDuration='medium',
                     relevanceLanguage='en',
                     regionCode='US',  # ← NEW: Bias toward US uploads
-                    order='relevance',
-                    safeSearch='strict'
+                    order=random_order,  # ← NEW: Randomize order
+                    safeSearch='strict',
+                    pageToken=pagination_state.get('cc_page_token')  # ← NEW: Pagination
                 )
                 
                 response = request.execute()
                 quota_tracker.use_search_quota()
                 success = True
+                
+                # Save next page token
+                if 'nextPageToken' in response:
+                    pagination_state['cc_page_token'] = response['nextPageToken']
+                else:
+                    pagination_state['cc_page_token'] = None  # Reset for next query
                 
                 for item in response.get('items', []):
                     video_id = item['id']['videoId']
@@ -474,7 +507,12 @@ def search_creative_commons_videos(api_key, max_results=10, max_retries=3, ameri
     
     unique_videos = unique_videos[:max_results]
     
+    # Save pagination state
+    with open(pagination_file, 'w') as f:
+        json.dump(pagination_state, f, indent=2)
+    
     logger.info(f"✓ Found {len(unique_videos)} CC-BY licensed videos (after American filtering)")
+    logger.info(f"✓ Saved pagination state: query_index={pagination_state['query_index']}, session={pagination_state['session_count']}")
     return unique_videos
 
 
@@ -494,12 +532,27 @@ def search_ted_talks(api_key, max_results=10, max_retries=3, american_score_thre
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     
-    # TED-specific queries
-    queries = [
-        "TED talk",
-        "TEDx talk",
-        "TED conference",
+    # Load pagination state
+    pagination_file = Path('pagination_state.json')
+    if pagination_file.exists():
+        with open(pagination_file, 'r') as f:
+            pagination_state = json.load(f)
+    else:
+        pagination_state = {'cc_page_token': None, 'ted_page_token': None, 'query_index': 0, 'session_count': 0}
+    
+    # Expanded TED-specific queries
+    all_ted_queries = [
+        "TED talk", "TEDx talk", "TED conference", "TEDx conference",
+        "TED presentation", "TEDx presentation", "TED speaker", "TEDx speaker",
+        "TED ideas worth spreading", "TEDx ideas", "TED technology", "TEDx technology",
+        "TED business", "TEDx business", "TED education", "TEDx education"
     ]
+    
+    # Use different TED queries each session
+    ted_start = (pagination_state.get('session_count', 0) * 3) % len(all_ted_queries)
+    queries = all_ted_queries[ted_start:ted_start+3]  # Use 3 TED queries per session
+    
+    logger.info(f"TED Session {pagination_state.get('session_count', 0)}: Using TED queries {ted_start}-{ted_start+2}")
     
     all_videos = []
     youtube = build('youtube', 'v3', developerKey=api_key)
@@ -517,22 +570,33 @@ def search_ted_talks(api_key, max_results=10, max_retries=3, american_score_thre
         
         while attempt < max_retries and not success:
             try:
+                # Add randomization for TED searches too
+                order_options = ['viewCount', 'relevance', 'date']
+                random_order = random.choice(order_options)
+                
                 request = youtube.search().list(
                     part='id,snippet',
                     q=query,
                     type='video',
-                    maxResults=10,  # Get more to filter
+                    maxResults=12,  # Get more to filter (increased from 10)
                     videoDefinition='high',
                     videoDuration='medium',
                     relevanceLanguage='en',
                     regionCode='US',  # ← NEW: Bias toward US uploads
-                    order='viewCount',  # Popular TED talks
-                    safeSearch='strict'
+                    order=random_order,  # ← NEW: Randomize order
+                    safeSearch='strict',
+                    pageToken=pagination_state.get('ted_page_token')  # ← NEW: Pagination
                 )
                 
                 response = request.execute()
                 quota_tracker.use_search_quota()
                 success = True
+                
+                # Save next page token for TED
+                if 'nextPageToken' in response:
+                    pagination_state['ted_page_token'] = response['nextPageToken']
+                else:
+                    pagination_state['ted_page_token'] = None  # Reset for next query
                 
                 for item in response.get('items', []):
                     video_id = item['id']['videoId']
@@ -627,7 +691,12 @@ def search_ted_talks(api_key, max_results=10, max_retries=3, american_score_thre
     
     unique_videos = unique_videos[:max_results]
     
+    # Save pagination state
+    with open(pagination_file, 'w') as f:
+        json.dump(pagination_state, f, indent=2)
+    
     logger.info(f"✓ Found {len(unique_videos)} TED/TEDx talks (after American filtering)")
+    logger.info(f"✓ Saved TED pagination state: ted_page_token={pagination_state.get('ted_page_token', 'None')}")
     return unique_videos
 
 

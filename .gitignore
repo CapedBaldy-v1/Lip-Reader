@@ -98,6 +98,8 @@ coverage.xml
 checkpoints/
 models/
 weights/
+adapters/
+wav2vec2_checkpoints/
 best_model*.pt
 checkpoint_*.pt
 
@@ -123,6 +125,9 @@ raw_videos/
 *.mkv
 *.webm
 *.flv
+*.part
+*.ytdl
+*.part-Frag*.part
 
 # Preprocessed data
 preprocessed_data/
@@ -139,6 +144,7 @@ datasets/
 train/
 val/
 test/
+temp_metadata/
 
 # Transcripts (keep scripts, ignore generated data)
 transcripts/
@@ -170,6 +176,10 @@ youtube_scraper/data/
 *download_results.json
 *legal_download_results.json
 ATTRIBUTION.txt
+download_state.json
+no_api_state.json
+pagination_state.json
+*_state.json
 
 # ============================================
 # LOGS AND TEMPORARY FILES
@@ -237,19 +247,15 @@ lrs3_download/
 lrs2_download/
 
 # Training results
-# Training results
 training_results*.json
 split_info.json
 preprocessing_metadata.json
 all_transcripts.json
+american_download_results.json
+accent_verification_results.json
+error_log.json
 
-# Ignore ALL .md files except README.md
-*.md
-!README.md
-
-# Handoff and personal notes
-SCRAPER_DELIVERY_SUMMARY.txt
-YOUTUBE_API_SIMPLE_GUIDE.txt
+# Personal notes and local scratch docs
 NOTES.md
 TODO.md
 
@@ -266,7 +272,6 @@ dataset creation/
 *.css
 *.js
 *.svg
-!*.py  # Keep Python files
 
 # ============================================
 # KEEP THESE (explicitly not ignored)
@@ -277,7 +282,13 @@ dataset creation/
 
 # Keep documentation
 !README.md
+!HANDOFF.md
+!study_design.md
+!LEGAL_AND_ETHICAL_CONSIDERATIONS.md
 !docs/
+!youtube_scraper/*.md
+!youtube_scraper/requirements.txt
+!youtube_scraper/setup_scraper.sh
 
 # Keep configuration examples
 !config.example.json
