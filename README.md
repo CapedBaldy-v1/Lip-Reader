@@ -76,6 +76,29 @@ data/
   metadata.json
 ```
 
+## YouTube CC Scraper
+
+The no-API scraper works on Linux and Windows as long as `yt-dlp` is installed:
+
+```bash
+python -m pip install -r requirements.txt
+python scrape_youtube_no_api.py status
+python scrape_youtube_no_api.py run --test
+python scrape_youtube_no_api.py run --target 2000
+python scrape_youtube_no_api.py continue
+```
+
+It searches YouTube's Creative Commons filter, verifies each video's license in
+metadata, applies the American-English heuristic filter, and downloads with
+bounded parallelism plus jittered delays to reduce block/rate-limit risk.
+
+Progress is saved in `no_api_state.json`. If the machine powers off, rerun
+`python scrape_youtube_no_api.py continue`; it reuses the previous command
+settings, keeps completed files, retries interrupted downloads, and avoids
+videos already marked downloaded or failed. Human-readable logs go to
+`no_api_scraper.log`; structured resume/debug events go to
+`no_api_scraper_events.jsonl`.
+
 ## Training
 
 Basic training:

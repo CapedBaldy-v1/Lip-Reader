@@ -178,6 +178,8 @@ youtube_scraper/data/
 ATTRIBUTION.txt
 download_state.json
 no_api_state.json
+no_api_scraper_events.jsonl
+*_events.jsonl
 pagination_state.json
 *_state.json
 
@@ -293,3 +295,31 @@ dataset creation/
 # Keep configuration examples
 !config.example.json
 !.env.example
+american_english_filtered/dry_run_results.jsonl
+american_english_filtered/dry_run_summary.json
+american_english_filtered/results.jsonl
+american_english_filtered/state.json
+american_english_filtered/summary.json
+american_visual_active_speaker_filtered/dry_run_results.jsonl
+american_visual_active_speaker_filtered/dry_run_summary.json
+american_visual_active_speaker_filtered/results.jsonl
+american_visual_active_speaker_filtered/state.json
+american_visual_active_speaker_filtered/summary.json
+american_visual_filtered/dry_run_results.jsonl
+american_visual_filtered/dry_run_summary.json
+american_visual_filtered/results.jsonl
+american_visual_filtered/state.json
+american_visual_filtered/summary.json
+american_visual_segment_acceptance_dryrun/dry_run_results.jsonl
+american_visual_segment_acceptance_dryrun/dry_run_summary.json
+american_visual_segment_filtered/results.jsonl
+american_visual_segment_filtered/summary.json
+american_visual_segment_filtered/state.json
+american_visual_segment_filtered_heavy/results.jsonl
+american_visual_segment_filtered_heavy/state.json
+american_visual_segment_filtered_heavy/summary.json
+american_visual_segment_filtered_heavy/model_cache/face_landmarker.task
+american_visual_segment_filtered/best_usable_segments.tsv
+american_visual_filtered/model_cache/face_landmarker.task
+american_visual_active_speaker_filtered/model_cache/face_landmarker.task
+american_english_filtered/model_cache/Jzuluaga__accent-id-commonaccent_ecapa/hyperparams.yaml
