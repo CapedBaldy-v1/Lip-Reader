@@ -131,6 +131,11 @@ raw_videos/
 
 # Preprocessed data
 preprocessed_data/
+final_preprocessed_dataset/
+final_preprocessed_dataset_fast/
+final_preprocessed_dataset_*/
+final_training_dataset/
+codex_preprocess_*/
 processed/
 lip_rois/
 *.npy
@@ -180,6 +185,11 @@ download_state.json
 no_api_state.json
 no_api_scraper_events.jsonl
 *_events.jsonl
+playlist_final_downloader.log
+_playlist_download_archive.txt
+playlist_download_archive.txt
+youtube_cookies*.txt
+cookies*.txt
 pagination_state.json
 *_state.json
 
@@ -323,3 +333,17 @@ american_visual_segment_filtered/best_usable_segments.tsv
 american_visual_filtered/model_cache/face_landmarker.task
 american_visual_active_speaker_filtered/model_cache/face_landmarker.task
 american_english_filtered/model_cache/Jzuluaga__accent-id-commonaccent_ecapa/hyperparams.yaml
+codex_embedding_smoke/errors.json
+codex_embedding_smoke/manifest.json
+codex_embedding_smoke/summary.json
+codex_embedding_smoke_gpu/errors.json
+codex_embedding_smoke_gpu/manifest.json
+codex_embedding_smoke_gpu/summary.json
+codex_embedding_train_smoke/history.json
+codex_embedding_train_smoke/run_config.json
+codex_temporal_embedding_smoke/errors.json
+codex_temporal_embedding_smoke/manifest.json
+codex_temporal_embedding_smoke/summary.json
+final_visual_embeddings_fast/errors.json
+final_visual_embeddings_fast/manifest.json
+final_visual_embeddings_fast/summary.json
