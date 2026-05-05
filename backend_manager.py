@@ -231,7 +231,7 @@ def get_autocast_context():
     from contextlib import nullcontext
 
     if is_mixed_precision_available():
-        return torch.cuda.amp.autocast()
+        return torch.amp.autocast(device_type='cuda', dtype=torch.float16)
     return nullcontext()
 
 
@@ -243,7 +243,7 @@ def get_grad_scaler():
         GradScaler if available, else None
     """
     if is_mixed_precision_available():
-        return torch.cuda.amp.GradScaler()
+        return torch.amp.GradScaler('cuda')
     return None
 
 

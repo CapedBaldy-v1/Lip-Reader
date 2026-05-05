@@ -7,6 +7,35 @@ adds live captions, translation, and a post-session summary.
 
 This project is not multimodal. It is video-only.
 
+## 🚀 Quick Start: Training for Publication (20-Hour Deadline)
+
+**Your training is optimized and ready!** Estimated time: **4-5 hours** (well within 20h deadline)
+
+### Step 1: Smoke Test (5 minutes - DO THIS FIRST!)
+```bash
+python train_swin_vallr.py --data_dir final_preprocessed_dataset_fast --smoke_test
+```
+
+### Step 2: Full Training (4-5 hours)
+```bash
+python train_swin_vallr.py \
+    --data_dir final_preprocessed_dataset_fast \
+    --batch_size 4 \
+    --epochs 300 \
+    --lr 3e-5 \
+    --num_workers 4 \
+    --time_budget_hours 19.5 \
+    --early_stopping_patience 20 \
+    --seed 42
+```
+
+### Step 3: Get Results
+All publication-ready figures automatically generated in `checkpoints/best/figures/`
+
+📖 **See**: `QUICK_START_20_HOUR_TRAINING.md` for detailed instructions
+
+---
+
 ## What This Project Does
 
 - Visual speech recognition from video-only input.
