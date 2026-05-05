@@ -3,8 +3,9 @@
 # Monitor training progress without keeping terminal open
 #
 
-LOG_FILE="checkpoints/final_end_to_end_run/training.log"
-PID_FILE="checkpoints/final_end_to_end_run/train.pid"
+CHECKPOINT_DIR="${1:-checkpoints/final_scratch_run}"
+LOG_FILE="$CHECKPOINT_DIR/training.log"
+PID_FILE="$CHECKPOINT_DIR/train.pid"
 
 if [ ! -f "$PID_FILE" ]; then
     echo "Training not running (no PID file found)"
@@ -20,6 +21,7 @@ if ! ps -p $PID > /dev/null 2>&1; then
 fi
 
 echo "Training is running (PID: $PID)"
+echo "Checkpoint directory: $CHECKPOINT_DIR"
 echo "Press Ctrl+C to stop monitoring (training will continue)"
 echo "=========================================="
 tail -f "$LOG_FILE"

@@ -3,7 +3,8 @@
 # Stop training gracefully
 #
 
-PID_FILE="checkpoints/final_end_to_end_run/train.pid"
+CHECKPOINT_DIR="${1:-checkpoints/final_scratch_run}"
+PID_FILE="$CHECKPOINT_DIR/train.pid"
 
 if [ ! -f "$PID_FILE" ]; then
     echo "No training process found"

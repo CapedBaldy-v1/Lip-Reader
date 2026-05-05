@@ -12,11 +12,15 @@ Features:
 - TensorBoard logging
 """
 
-# AF_UNIX sockets have a 108-char path limit on Linux. Reset TMPDIR to /tmp
-# before any imports so multiprocessing worker processes inherit the short path.
+# AF_UNIX sockets have a 108-char path limit on Linux. Force TMPDIR to a short
+# path before any imports so multiprocessing worker processes inherit it.
 import os as _os
+_train_tmp = _os.environ.get("TMPDIR") or "/tmp/agam-train-tmp"
+if len(_train_tmp) > 80:
+    _train_tmp = "/tmp/agam-train-tmp"
+_os.makedirs(_train_tmp, exist_ok=True)
 for _v in ("TMPDIR", "TEMP", "TMP"):
-    _os.environ[_v] = "/tmp"
+    _os.environ[_v] = _train_tmp
 
 import os
 import sys
@@ -113,15 +117,15 @@ class TrainingConfig:
     attention_entropy_weight: float = 0.01
     
     # NEW: Label smoothing for better generalization
-    label_smoothing: float = 0.1
+    label_smoothing: float = 0.0
     
     # NEW: Use beam search by default
     use_beam_search: bool = True
     beam_width: int = 10
     
     # OPTIMIZATION: Early stopping for 20-hour deadline
-    early_stopping_patience: int = 20  # INCREASED to 20 for 300 epochs (more patience needed)
-    early_stopping_min_delta: float = 0.001  # Minimum improvement to count
+    early_stopping_patience: int = 100  # INCREASED to 100 for slow learning rate (was 20)
+    early_stopping_min_delta: float = 0.0001  # REDUCED to capture smaller improvements (was 0.001)
     
     # OPTIMIZATION: Adaptive validation (validate less frequently early on)
     adaptive_validation: bool = True
@@ -137,6 +141,11 @@ class TrainingConfig:
     
     # OPTIMIZATION: Time budget (in hours, 0 = no limit)
     time_budget_hours: float = 0.0  # Set to 19.5 to leave buffer for 20-hour deadline
+
+    # Fast fine-tuning controls
+    freeze_visual_encoder: bool = False
+    progress_every: int = 100
+    save_last_every: int = 3
 
 
 # =============================================================================
@@ -171,8 +180,8 @@ class CTCLossWrapper(nn.Module):
         target_lengths = []
 
         for text in texts:
-            phonemes = text_to_phonemes(text)
-            indices = [self.phoneme_to_idx.get(p, self.blank_idx) for p in phonemes]
+            phonemes = _target_phoneme_sequence(text, self.phoneme_vocab)
+            indices = [self.phoneme_to_idx[p] for p in phonemes if p in self.phoneme_to_idx]
             if not indices:
                 LOGGER.warning("Empty phoneme target for text: %s", text)
                 indices = [self.blank_idx]
@@ -323,6 +332,13 @@ def _word_error_rate(pred: str, target: str) -> float:
     return prev[n] / n
 
 
+def _target_phoneme_sequence(text: str, vocab: Optional[List[str]] = None) -> List[str]:
+    """Convert text to trainable phoneme tokens, excluding unknowns and blanks."""
+    allowed = set(vocab or get_phoneme_vocab())
+    allowed.discard('<blank>')
+    return [p for p in text_to_phonemes(text) if p in allowed]
+
+
 def _update_confusion(
     confusion: "np.ndarray",
     ph_correct: "np.ndarray",
@@ -405,20 +421,37 @@ class Trainer:
 
         self.ctc_loss = CTCLossWrapper(label_smoothing=config.label_smoothing)
 
-        # IMPROVED: Differential learning rates for different components
-        param_groups = [
-            {'params': model.visual_encoder.parameters(), 'lr': config.learning_rate * 0.3},  # Lower LR for encoder
-            {'params': model.temporal_adapter.parameters(), 'lr': config.learning_rate * 0.5},
-            {'params': model.phoneme_head.parameters(), 'lr': config.learning_rate},  # Higher LR for head
-        ]
+        if config.freeze_visual_encoder:
+            for param in model.visual_encoder.parameters():
+                param.requires_grad = False
+            model.visual_encoder.eval()
+            LOGGER.info("Visual encoder frozen for fast fine-tuning.")
+
+        # IMPROVED: Differential learning rates for different components.
+        param_groups = []
+
+        def add_param_group(module: nn.Module, lr: float, name: str) -> None:
+            params = [p for p in module.parameters() if p.requires_grad]
+            if params:
+                param_groups.append({'params': params, 'lr': lr, 'name': name})
+
+        if not config.freeze_visual_encoder:
+            add_param_group(model.visual_encoder, config.learning_rate * 0.3, 'visual_encoder')
+        add_param_group(model.temporal_adapter, config.learning_rate * 0.5, 'temporal_adapter')
+        add_param_group(model.phoneme_head, config.learning_rate, 'phoneme_head')
         
         # Add temporal attention if it exists
         if hasattr(model, 'temporal_attention') and model.temporal_attention is not None:
-            param_groups.append({'params': model.temporal_attention.parameters(), 'lr': config.learning_rate * 0.5})
+            add_param_group(model.temporal_attention, config.learning_rate * 0.5, 'temporal_attention')
         
         # Add temporal multiscale if it exists
         if hasattr(model, 'temporal_multiscale') and model.temporal_multiscale is not None:
-            param_groups.append({'params': model.temporal_multiscale.parameters(), 'lr': config.learning_rate * 0.5})
+            add_param_group(model.temporal_multiscale, config.learning_rate * 0.5, 'temporal_multiscale')
+        if hasattr(model, 'feature_norm') and model.feature_norm is not None:
+            add_param_group(model.feature_norm, config.learning_rate * 0.7, 'feature_norm')
+
+        if not param_groups:
+            raise RuntimeError("No trainable parameters selected. Check freeze/training configuration.")
 
         self.optimizer = AdamW(
             param_groups,
@@ -493,6 +526,9 @@ class Trainer:
                 "seed": self.config.seed,
                 "early_stopping_patience": self.config.early_stopping_patience,
                 "time_budget_hours": self.config.time_budget_hours,
+                "label_smoothing": self.config.label_smoothing,
+                "freeze_visual_encoder": self.config.freeze_visual_encoder,
+                "save_last_every": self.config.save_last_every,
             }
             save_json(self.artifact_root / "training_config.json", summary)
             save_text(self.artifact_root / "notes.txt", "Training artifacts and metrics.")
@@ -616,18 +652,19 @@ class Trainer:
         improvement = self.best_val_loss - val_loss
         
         if val_loss < (self.best_val_loss - self.config.early_stopping_min_delta):
-            # Significant improvement
+            # Significant improvement - reset counter and update best epoch
             self.epochs_without_improvement = 0
             self.best_epoch = self.current_epoch + 1
-            LOGGER.info("Early stopping: significant improvement detected (delta=%.4f, new_best=%.4f)",
-                       improvement, val_loss)
+            LOGGER.info("Early stopping: significant improvement detected (delta=%.4f, new_best=%.4f, best_epoch=%d)",
+                       improvement, val_loss, self.best_epoch)
             return False
         else:
             # No significant improvement
             self.epochs_without_improvement += 1
-            LOGGER.info("Early stopping: no significant improvement (delta=%.4f < min_delta=%.4f, patience=%d/%d)",
+            LOGGER.info("Early stopping: no significant improvement (delta=%.4f < min_delta=%.4f, patience=%d/%d, best_epoch=%d)",
                        improvement, self.config.early_stopping_min_delta,
-                       self.epochs_without_improvement, self.config.early_stopping_patience)
+                       self.epochs_without_improvement, self.config.early_stopping_patience,
+                       self.best_epoch)
             
             if self.epochs_without_improvement >= self.config.early_stopping_patience:
                 print(f"\n[Early Stopping] No improvement for {self.config.early_stopping_patience} epochs")
@@ -692,6 +729,26 @@ class Trainer:
         if not penalties:
             return torch.tensor(0.0, device=device)
         return torch.stack(penalties).mean()
+
+    def _extract_training_features(self, video: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Extract features for training, optionally freezing the visual encoder."""
+        if not self.config.freeze_visual_encoder:
+            if self.config.attention_entropy_weight > 0:
+                return self.model.extract_features_with_attention(video)
+            return self.model.extract_features(video), []
+
+        self.model.visual_encoder.eval()
+        with torch.no_grad():
+            features = self.model.visual_encoder(video)
+        features = self.model.temporal_adapter(features)
+        features = self.model.temporal_multiscale(features)
+        if self.config.attention_entropy_weight > 0:
+            features, attn_weights = self.model.temporal_attention(features, return_attn=True)
+        else:
+            features = self.model.temporal_attention(features)
+            attn_weights = []
+        features = self.model.feature_norm(features)
+        return features, attn_weights
 
     def _save_loss_artifacts(self) -> None:
         """Save loss curves and raw loss data."""
@@ -937,7 +994,7 @@ class Trainer:
                 break
             
             # Manual progress update for single-threaded
-            if not use_tqdm and batch_idx % 10 == 0:
+            if not use_tqdm and batch_idx % max(1, self.config.progress_every) == 0:
                 print(f"{batch_idx}/{max_batches}...", end='', flush=True)
                 
             video = batch['video'].to(self.device)
@@ -948,11 +1005,7 @@ class Trainer:
 
             if self.use_amp:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    if self.config.attention_entropy_weight > 0:
-                        features, attn_weights = self.model.extract_features_with_attention(video)
-                    else:
-                        features = self.model.extract_features(video)
-                        attn_weights = []
+                    features, attn_weights = self._extract_training_features(video)
                     logits = self.model.phoneme_head(features)
                     ctc_loss = self.ctc_loss(logits, texts)
                     decor_loss = self._decorrelation_loss(features)
@@ -965,11 +1018,7 @@ class Trainer:
                         + self.config.attention_entropy_weight * attn_loss
                     )
             else:
-                if self.config.attention_entropy_weight > 0:
-                    features, attn_weights = self.model.extract_features_with_attention(video)
-                else:
-                    features = self.model.extract_features(video)
-                    attn_weights = []
+                features, attn_weights = self._extract_training_features(video)
                 logits = self.model.phoneme_head(features)
                 ctc_loss = self.ctc_loss(logits, texts)
                 decor_loss = self._decorrelation_loss(features)
@@ -1084,7 +1133,17 @@ class Trainer:
         sample_results: List[Dict] = []
         max_samples_to_store = 100  # Only store first 100 samples
 
-        for batch in tqdm(self.val_loader, desc="Validation"):
+        use_tqdm = self.val_loader.num_workers > 0
+        if use_tqdm:
+            iterator = enumerate(tqdm(self.val_loader, desc="Validation"))
+        else:
+            print("Validation: ", end="", flush=True)
+            iterator = enumerate(self.val_loader)
+
+        for batch_idx, batch in iterator:
+            if not use_tqdm and batch_idx % 10 == 0:
+                print(f"{batch_idx}/{len(self.val_loader)}...", end="", flush=True)
+
             video = batch['video'].to(self.device)
             texts = batch['text']
 
@@ -1097,19 +1156,19 @@ class Trainer:
                 preds = self.model.decode_ctc(logits)
                 for pred_phonemes, target_text in zip(preds, texts):
                     pred_str    = ' '.join(pred_phonemes).lower().strip()
-                    target_str  = target_text.lower().strip()
+                    tgt_phonemes = _target_phoneme_sequence(target_text, phoneme_vocab)
+                    target_str  = ' '.join(tgt_phonemes).lower().strip()
 
-                    # CER
+                    # CER is now measured on the phoneme string. WER is a
+                    # phoneme-token error rate proxy, not English word WER.
                     cer = _char_error_rate(pred_str, target_str) if target_str else 0.0
                     total_cer  += cer
                     num_samples += 1
 
-                    # WER
                     wer = _word_error_rate(pred_str, target_str)
                     total_wer += wer
 
                     # Phoneme confusion: align predicted phonemes vs target phonemes
-                    tgt_phonemes = text_to_phonemes(target_text)
                     _update_confusion(confusion, ph_correct, ph_total,
                                       tgt_phonemes, pred_phonemes, ph_to_idx)
 
@@ -1117,6 +1176,7 @@ class Trainer:
                     if len(sample_results) < max_samples_to_store:
                         sample_results.append({
                             "target":    target_text,
+                            "target_phonemes": target_str,
                             "predicted": pred_str,
                             "cer":       round(cer, 4),
                             "wer":       round(wer, 4),
@@ -1124,6 +1184,11 @@ class Trainer:
             except Exception as e:
                 LOGGER.warning("Error during validation decoding: %s", str(e))
                 pass
+
+            del video, logits, loss
+
+        if not use_tqdm:
+            print("Done!", flush=True)
 
         avg_loss = total_loss / max(num_batches, 1)
         avg_cer  = total_cer  / max(num_samples, 1)
@@ -1441,6 +1506,7 @@ class Trainer:
                     lines += [
                         f"\n[{i}]",
                         f"  Target:    {s['target']}",
+                        f"  Target PH: {s.get('target_phonemes', '')}",
                         f"  Predicted: {s['predicted']}",
                         f"  CER: {s['cer']:.4f}   WER: {s['wer']:.4f}",
                     ]
@@ -1472,6 +1538,26 @@ class Trainer:
         gc.collect()
         LOGGER.debug("Cleared validation results and collected garbage after figure generation")
 
+    def _atomic_torch_save(self, checkpoint: Dict, path: Path) -> None:
+        """Save a checkpoint through a per-process temp file, then replace.
+
+        Reusing a fixed temp filename can race when an old/stale training process is
+        still writing to the same checkpoint directory, and NTFS mounts are less
+        forgiving about that pattern.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            torch.save(checkpoint, temp_path)
+            os.replace(temp_path, path)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove temporary checkpoint file: %s", temp_path)
+
     def save_checkpoint_to(self, path: Path) -> None:
         """Save a full checkpoint to an explicit path."""
         checkpoint = {
@@ -1493,7 +1579,7 @@ class Trainer:
         }
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-        torch.save(checkpoint, path)
+        self._atomic_torch_save(checkpoint, path)
 
     def save_checkpoint(self, filename: str):
         """Save model checkpoint with all training state."""
@@ -1520,21 +1606,36 @@ class Trainer:
 
         checkpoint_path = self.checkpoint_dir / filename
         
-        # Save to temporary file first, then rename (atomic operation)
-        temp_path = checkpoint_path.with_suffix('.tmp')
-        torch.save(checkpoint, temp_path)
-        temp_path.rename(checkpoint_path)
+        self._atomic_torch_save(checkpoint, checkpoint_path)
         
         print(f"[Trainer] Saved checkpoint: {filename}")
         LOGGER.info("Checkpoint saved: %s (epoch=%d, global_step=%d, best_val_loss=%.4f)",
                    filename, self.current_epoch, self.global_step, self.best_val_loss)
 
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str, weights_only: bool = False):
         """Load model checkpoint and restore all training state."""
         LOGGER.info("Loading checkpoint from: %s", checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        if weights_only:
+            self.current_epoch = 0
+            self.global_step = 0
+            loaded_best_loss = checkpoint.get('best_val_loss', float('inf'))
+            loaded_best_epoch = checkpoint.get('best_epoch', checkpoint.get('epoch', -1) + 1)
+            self.best_val_loss = float('inf')
+            self.best_val_cer = float('inf')
+            self.best_epoch = 0
+            self.epochs_without_improvement = 0
+            print(f"[Trainer] Loaded model weights only from {checkpoint_path}")
+            print(f"[Trainer] Previous source best was val_loss={loaded_best_loss:.4f} (epoch {loaded_best_epoch})")
+            print("[Trainer] Reset optimizer and best tracking for the new fine-tune run")
+            LOGGER.info(
+                "Loaded checkpoint weights only: source=%s, source_best_val_loss=%.4f, source_best_epoch=%d",
+                checkpoint_path, loaded_best_loss, loaded_best_epoch
+            )
+            return
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.current_epoch = checkpoint['epoch'] + 1  # resume from NEXT epoch
@@ -1702,49 +1803,57 @@ class Trainer:
                 val_loss, val_cer = self.validate()
                 
                 print(f"  Val Loss: {val_loss:.4f}")
-                print(f"  Val CER: {val_cer:.2%} (lower is better)")
+                print(f"  Val Phoneme CER: {val_cer:.2%} (lower is better)")
                 
                 LOGGER.info("Epoch %d validation: val_loss=%.4f, val_cer=%.4f",
                             epoch + 1, val_loss, val_cer)
                 self._save_loss_artifacts()
 
+                val_improved = val_loss < self.best_val_loss
                 if val_loss < self.best_val_loss:
                     improvement = self.best_val_loss - val_loss
                     self.best_val_loss = val_loss
                     self.best_val_cer  = val_cer
+                    self.best_epoch = epoch + 1  # Update best_epoch here too!
+                    self.epochs_without_improvement = 0
                     
                     print(f"  🎉 NEW BEST MODEL! Improvement: {improvement:.4f}")
                     print(f"  Best Val Loss: {val_loss:.4f}")
-                    print(f"  Best Val CER: {val_cer:.2%}")
+                    print(f"  Best Val Phoneme CER: {val_cer:.2%}")
+                    print(f"  Best Epoch: {self.best_epoch}")
                     
-                    LOGGER.info("New best model: val_loss=%.4f (improvement=%.4f), val_cer=%.4f",
-                               val_loss, improvement, val_cer)
+                    LOGGER.info("New best model: val_loss=%.4f (improvement=%.4f), val_cer=%.4f, best_epoch=%d",
+                               val_loss, improvement, val_cer, self.best_epoch)
                     self._save_best(val_loss, val_cer, train_loss, epoch + 1)
                 else:
-                    print(f"  No improvement (best: {self.best_val_loss:.4f})")
-                    LOGGER.info("No improvement: current_val_loss=%.4f >= best_val_loss=%.4f",
-                               val_loss, self.best_val_loss)
+                    print(f"  No improvement (best: {self.best_val_loss:.4f} at epoch {self.best_epoch})")
+                    LOGGER.info("No improvement: current_val_loss=%.4f >= best_val_loss=%.4f (best_epoch=%d)",
+                               val_loss, self.best_val_loss, self.best_epoch)
                 
                 print(f"{'='*60}\n")
                 
                 # EARLY STOPPING CHECK
-                if self._check_early_stopping(val_loss):
+                if (not val_improved) and self._check_early_stopping(val_loss):
                     print(f"\n[Trainer] Early stopping triggered - training complete!")
                     LOGGER.info("Training stopped early at epoch %d", epoch + 1)
                     break
             else:
-                print(f"  (Validation skipped - adaptive schedule)")
+                print(f"  (Validation skipped this epoch)")
                 print(f"{'='*60}\n")
-                LOGGER.debug("Skipping validation for epoch %d (adaptive validation)", epoch + 1)
+                LOGGER.debug("Skipping validation for epoch %d", epoch + 1)
 
             if (epoch + 1) % self.config.save_every == 0:
                 print(f"[Trainer] 💾 Saving milestone checkpoint (epoch {epoch+1})")
                 LOGGER.info("Saving milestone checkpoint at epoch %d", epoch + 1)
                 self.save_checkpoint(f"checkpoint_epoch_{epoch+1}.pt")
 
-            # Save after every epoch so a crash can be resumed automatically.
-            self.save_checkpoint("last_epoch.pt")
-            LOGGER.debug("Saved last_epoch.pt checkpoint")
+            should_save_last = (
+                (epoch + 1) % max(1, self.config.save_last_every) == 0
+                or (epoch + 1) == self.config.epochs
+            )
+            if should_save_last:
+                self.save_checkpoint("last_epoch.pt")
+                LOGGER.debug("Saved last_epoch.pt checkpoint")
             
             # TIME BUDGET CHECK
             if self._check_time_budget():
@@ -1786,6 +1895,12 @@ def parse_args():
                         help='Number of epochs (default: 300, early stopping recommended)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate (default: 1e-4)')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='AdamW weight decay (default: 0.01)')
+    parser.add_argument('--accumulation_steps', type=int, default=2,
+                        help='Gradient accumulation steps (default: 2)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Optional CTC label smoothing weight (default: 0.0)')
 
     parser.add_argument('--load_refiner', action='store_true',
                         help='Load Qwen2 refiner for joint training')
@@ -1794,9 +1909,19 @@ def parse_args():
                         help='Checkpoint directory (default: checkpoints)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint')
+    parser.add_argument('--load_weights_only', action='store_true',
+                        help='Load only model weights from --resume and reset optimizer/epoch counters')
 
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers (default: 4)')
+    parser.add_argument('--save_every', type=int, default=5,
+                        help='Save milestone checkpoint every N epochs (default: 5)')
+    parser.add_argument('--save_last_every', type=int, default=3,
+                        help='Save resumable last_epoch.pt every N epochs (default: 3)')
+    parser.add_argument('--eval_every', type=int, default=1,
+                        help='Validate every N epochs when adaptive validation is disabled (default: 1)')
+    parser.add_argument('--progress_every', type=int, default=100,
+                        help='Print single-worker batch progress every N batches (default: 100)')
 
     parser.add_argument('--decorrelation_weight', type=float, default=0.03,
                         help='Weight for decorrelation loss (default: 0.03)')
@@ -1824,8 +1949,8 @@ def parse_args():
                         help='Use the full dataset from epoch 1 instead of single-word/short-sentence curriculum')
     
     # OPTIMIZATION: New arguments for 20-hour deadline
-    parser.add_argument('--early_stopping_patience', type=int, default=20,
-                        help='Stop training if no improvement for N epochs (default: 20, recommended for 300 epochs)')
+    parser.add_argument('--early_stopping_patience', type=int, default=100,
+                        help='Stop training if no improvement for N epochs (default: 100, recommended for 300 epochs)')
     parser.add_argument('--time_budget_hours', type=float, default=0.0,
                         help='Maximum training time in hours (0 = no limit, recommend 19.5 for 20h deadline)')
     parser.add_argument('--seed', type=int, default=42,
@@ -1836,6 +1961,11 @@ def parse_args():
                         help='Run quick smoke test (2 epochs, 10 batches each) to verify setup')
     parser.add_argument('--adaptive_validation', action='store_true', default=True,
                         help='Validate less frequently early on (default: True)')
+    parser.add_argument('--no_adaptive_validation', '--no-adaptive-validation',
+                        action='store_false', dest='adaptive_validation',
+                        help='Use fixed --eval_every validation schedule')
+    parser.add_argument('--freeze_visual_encoder', action='store_true',
+                        help='Freeze the visual encoder and fine-tune temporal/head layers only')
 
     return parser.parse_args()
 
@@ -1846,7 +1976,14 @@ def _build_training_config(args) -> TrainingConfig:
     config.batch_size = args.batch_size
     config.epochs = args.epochs
     config.learning_rate = args.lr
+    config.weight_decay = args.weight_decay
+    config.accumulation_steps = args.accumulation_steps
+    config.label_smoothing = args.label_smoothing
     config.checkpoint_dir = args.checkpoint_dir
+    config.save_every = args.save_every
+    config.save_last_every = args.save_last_every
+    config.eval_every = args.eval_every
+    config.progress_every = args.progress_every
     config.decorrelation_weight = args.decorrelation_weight
     config.decorrelation_anchor = args.decorrelation_anchor
     config.temporal_smoothness_weight = args.temporal_smoothness_weight
@@ -1859,6 +1996,7 @@ def _build_training_config(args) -> TrainingConfig:
     config.deterministic = args.deterministic
     config.smoke_test = args.smoke_test
     config.adaptive_validation = args.adaptive_validation
+    config.freeze_visual_encoder = args.freeze_visual_encoder
     
     if args.disable_curriculum:
         config.curriculum_phases = (0, 0)
@@ -2050,7 +2188,7 @@ def main():
     if resume_path:
         print(f"[Main] Loading checkpoint: {resume_path}")
         LOGGER.info("Resuming training from checkpoint: %s", resume_path)
-        trainer.load_checkpoint(resume_path)
+        trainer.load_checkpoint(resume_path, weights_only=args.load_weights_only)
         print(f"[Main] ✅ Resume successful - continuing training\n")
     else:
         print(f"[Main] Starting training from scratch (no checkpoint to resume)\n")
