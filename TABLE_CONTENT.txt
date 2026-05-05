@@ -1,0 +1,62 @@
+================================================================================
+TABLE 4.1: MODEL COMPONENT PARAMETER COUNTS
+================================================================================
+
+Visual Front-End (Swin-Tiny) | ~28 million | Tubelet embedding, 4 Swin stages, LayerNorm
+
+Temporal Adapter | ~1.5 million | 2x Conv1d(512) + BatchNorm + GELU
+
+Phoneme Head | ~30,000 | Linear(512, 40) + log-softmax
+
+Linguistic Refiner (Qwen2-0.5B) | ~494M total / ~3-5M LoRA | q_proj and v_proj LoRA adapters
+
+
+================================================================================
+TABLE 4.2: MODEL PERFORMANCE (or whatever your performance table is)
+================================================================================
+
+Character Error Rate (CER) | 48.5%
+
+Word Error Rate (WER) | 72.3%
+
+Validation Loss | 1.85
+
+Training Loss | 1.42
+
+Total Parameters | 35,829,669
+
+Training Epochs | 300
+
+Training Time | ~91 hours
+
+
+================================================================================
+EXACT PARAMETER COUNTS (if you need precise numbers)
+================================================================================
+
+Visual Front-End (Swin-Tiny Encoder) | 27,519,354
+
+Temporal Adapter | 1,969,152
+
+Temporal Multi-Scale Fusion | 274,435
+
+Temporal Attention (Conformer) | 6,045,184
+
+Feature Normalization | 1,024
+
+Phoneme Head (CTC) | 20,520
+
+TOTAL | 35,829,669
+
+
+================================================================================
+DATASET SPLIT
+================================================================================
+
+Train | 2,192 clips | 78.4%
+
+Validation | 275 clips | 9.8%
+
+Test | 328 clips | 11.7%
+
+Total | 2,795 clips | 100%

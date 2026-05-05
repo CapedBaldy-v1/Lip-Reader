@@ -380,3 +380,14 @@ verify_fixes.sh
 final_visual_embeddings_temporal/errors.json
 final_visual_embeddings_temporal/manifest.json
 final_visual_embeddings_temporal/summary.json
+TRAINING_INSTRUCTIONS.md
+START_TRAINING_FIXED.md
+PROJECT_REPORT_METRICS.md
+PROJECT_REPORT_CODE_BLOCKS.md
+METRICS_SUMMARY.md
+MEMORY_LEAK_FIXES_APPLIED.md
+EARLY_STOPPING_BUG_FIX.md
+COMPLETE_PROJECT_METRICS.md
+CHECKPOINT_VERIFICATION.md
+CHECKPOINT_SYSTEM.md
+CHECKPOINT_QUICK_REFERENCE.md

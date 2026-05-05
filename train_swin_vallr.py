@@ -30,6 +30,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import gc  # For memory cleanup
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
@@ -90,7 +91,7 @@ class TrainingConfig:
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
-    save_every: int = 20  # INCREASED to 20 - save less frequently to avoid wasting time
+    save_every: int = 5  # Save checkpoint every 5 epochs
 
     # Logging
     log_every: int = 10
@@ -446,6 +447,12 @@ class Trainer:
         self.step_metrics: List[Tuple[int, float, float, float, float, float]] = []
         self.epoch_metrics: List[Tuple[int, float, float, float, float, float]] = []
         self.val_losses: List[Tuple[int, float]] = []
+        
+        # MEMORY LEAK FIX: Limit list sizes to prevent unbounded growth
+        self.max_step_metrics = 10000  # Keep only last 10k steps
+        self.max_epoch_metrics = 1000  # Keep only last 1000 epochs
+        self.max_val_losses = 1000     # Keep only last 1000 validations
+        
         self._preview_epochs = set()
         self._logit_epochs = set()
         self._prediction_epochs = set()
@@ -491,6 +498,35 @@ class Trainer:
             save_text(self.artifact_root / "notes.txt", "Training artifacts and metrics.")
         except Exception:
             log_exception(LOGGER, "Failed to save training metadata.")
+    
+    def _cleanup_memory(self) -> None:
+        """Force garbage collection and clear GPU cache to prevent memory leaks."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        LOGGER.debug("Memory cleanup: garbage collected and GPU cache cleared")
+    
+    def _trim_metrics_lists(self) -> None:
+        """Trim metrics lists to prevent unbounded memory growth."""
+        if len(self.step_metrics) > self.max_step_metrics:
+            self.step_metrics = self.step_metrics[-self.max_step_metrics:]
+            LOGGER.debug("Trimmed step_metrics to %d entries", len(self.step_metrics))
+        
+        if len(self.epoch_metrics) > self.max_epoch_metrics:
+            self.epoch_metrics = self.epoch_metrics[-self.max_epoch_metrics:]
+            LOGGER.debug("Trimmed epoch_metrics to %d entries", len(self.epoch_metrics))
+        
+        if len(self.val_losses) > self.max_val_losses:
+            self.val_losses = self.val_losses[-self.max_val_losses:]
+            LOGGER.debug("Trimmed val_losses to %d entries", len(self.val_losses))
+    
+    def _flush_tensorboard(self) -> None:
+        """Flush TensorBoard writer to disk to prevent memory accumulation."""
+        try:
+            self.writer.flush()
+            LOGGER.debug("TensorBoard writer flushed")
+        except Exception:
+            log_exception(LOGGER, "Failed to flush TensorBoard writer")
     
     def _set_seed(self, seed: int) -> None:
         """Set random seeds for reproducibility."""
@@ -976,14 +1012,15 @@ class Trainer:
                 smooth_loss.item(),
                 attn_loss.item()
             )
+            # MEMORY LEAK FIX: Properly detach tensors before storing
             self.step_metrics.append(
                 (
                     self.global_step,
-                    loss.item(),
-                    ctc_loss.item(),
-                    decor_loss.item(),
-                    smooth_loss.item(),
-                    attn_loss.item()
+                    float(loss.detach().cpu().item()),
+                    float(ctc_loss.detach().cpu().item()),
+                    float(decor_loss.detach().cpu().item()),
+                    float(smooth_loss.detach().cpu().item()),
+                    float(attn_loss.detach().cpu().item())
                 )
             )
 
@@ -1001,12 +1038,22 @@ class Trainer:
                     smooth_loss.item(),
                     attn_loss.item()
                 )
+            
+            # MEMORY LEAK FIX: Explicitly delete tensors to free memory
+            del video, logits, features, loss, ctc_loss, decor_loss, smooth_loss, attn_loss
+            if 'attn_weights' in locals():
+                del attn_weights
         
         # Close manual progress line
         if not use_tqdm:
             avg_loss = total_loss / max(num_batches, 1)
             print(f" Done! Avg loss: {avg_loss:.4f}")
 
+        # MEMORY LEAK FIX: Cleanup at end of epoch
+        self._trim_metrics_lists()
+        self._flush_tensorboard()
+        self._cleanup_memory()
+        
         return total_loss / max(num_batches, 1)
 
     @torch.no_grad()
@@ -1033,7 +1080,9 @@ class Trainer:
         ph_total   = np.zeros(n_ph, dtype=np.int64)
 
         # Store sample-level results for qualitative table
+        # MEMORY LEAK FIX: Limit number of samples stored
         sample_results: List[Dict] = []
+        max_samples_to_store = 100  # Only store first 100 samples
 
         for batch in tqdm(self.val_loader, desc="Validation"):
             video = batch['video'].to(self.device)
@@ -1064,12 +1113,14 @@ class Trainer:
                     _update_confusion(confusion, ph_correct, ph_total,
                                       tgt_phonemes, pred_phonemes, ph_to_idx)
 
-                    sample_results.append({
-                        "target":    target_text,
-                        "predicted": pred_str,
-                        "cer":       round(cer, 4),
-                        "wer":       round(wer, 4),
-                    })
+                    # MEMORY LEAK FIX: Only store limited number of samples
+                    if len(sample_results) < max_samples_to_store:
+                        sample_results.append({
+                            "target":    target_text,
+                            "predicted": pred_str,
+                            "cer":       round(cer, 4),
+                            "wer":       round(wer, 4),
+                        })
             except Exception as e:
                 LOGGER.warning("Error during validation decoding: %s", str(e))
                 pass
@@ -1101,6 +1152,9 @@ class Trainer:
         
         LOGGER.debug("Validation results stored for figure generation: %d sample predictions", len(sample_results))
 
+        # MEMORY LEAK FIX: Cleanup after validation
+        self._cleanup_memory()
+        
         return avg_loss, avg_cer
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -1412,6 +1466,11 @@ class Trainer:
             log_exception(LOGGER, "Failed to save training summary JSON.")
 
         LOGGER.info("All publication-ready figures generated successfully: 11 files saved to %s", fig_dir)
+        
+        # MEMORY LEAK FIX: Clear validation results after figure generation
+        self._last_val_results = None
+        gc.collect()
+        LOGGER.debug("Cleared validation results and collected garbage after figure generation")
 
     def save_checkpoint_to(self, path: Path) -> None:
         """Save a full checkpoint to an explicit path."""
@@ -1423,17 +1482,21 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_val_cer':  self.best_val_cer,
+            'best_epoch': self.best_epoch,
+            'epochs_without_improvement': self.epochs_without_improvement,
             'config': vars(self.config),
             'model_config': asdict(self.model.config),
             'epoch_metrics': self.epoch_metrics,
             'step_metrics': self.step_metrics,
+            'val_losses': self.val_losses,
+            'epoch_times': self.epoch_times,
         }
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         torch.save(checkpoint, path)
 
     def save_checkpoint(self, filename: str):
-        """Save model checkpoint."""
+        """Save model checkpoint with all training state."""
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
@@ -1441,23 +1504,33 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'best_val_cer': self.best_val_cer,
+            'best_epoch': self.best_epoch,
+            'epochs_without_improvement': self.epochs_without_improvement,
             'config': vars(self.config),
             'model_config': asdict(self.model.config),
             'epoch_metrics': self.epoch_metrics,
             'step_metrics': self.step_metrics,
+            'val_losses': self.val_losses,
+            'epoch_times': self.epoch_times,
         }
 
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
 
         checkpoint_path = self.checkpoint_dir / filename
-        torch.save(checkpoint, checkpoint_path)
+        
+        # Save to temporary file first, then rename (atomic operation)
+        temp_path = checkpoint_path.with_suffix('.tmp')
+        torch.save(checkpoint, temp_path)
+        temp_path.rename(checkpoint_path)
+        
         print(f"[Trainer] Saved checkpoint: {filename}")
         LOGGER.info("Checkpoint saved: %s (epoch=%d, global_step=%d, best_val_loss=%.4f)",
                    filename, self.current_epoch, self.global_step, self.best_val_loss)
 
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
+        """Load model checkpoint and restore all training state."""
         LOGGER.info("Loading checkpoint from: %s", checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
@@ -1468,8 +1541,12 @@ class Trainer:
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.best_val_cer  = checkpoint.get('best_val_cer',  float('inf'))
+        self.best_epoch = checkpoint.get('best_epoch', 0)
+        self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
         self.epoch_metrics = checkpoint.get('epoch_metrics', [])
         self.step_metrics  = checkpoint.get('step_metrics', [])
+        self.val_losses = checkpoint.get('val_losses', [])
+        self.epoch_times = checkpoint.get('epoch_times', [])
 
         # Reload best metrics history from disk if it exists
         history_path = self.best_dir / "metrics_history.json"
@@ -1482,10 +1559,13 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             LOGGER.debug("Loaded gradient scaler state")
 
-        print(f"[Trainer] Resumed from epoch {checkpoint['epoch'] + 1} "
-              f"(next epoch: {self.current_epoch + 1})")
+        print(f"[Trainer] ✅ Resumed from epoch {checkpoint['epoch']} "
+              f"(continuing with epoch {self.current_epoch})")
+        print(f"[Trainer] Best val_loss so far: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
+        print(f"[Trainer] Early stopping: {self.epochs_without_improvement}/{self.config.early_stopping_patience} epochs without improvement")
+        
         LOGGER.info("Checkpoint loaded successfully: resuming from epoch %d (next: %d), global_step=%d, best_val_loss=%.4f",
-                    checkpoint['epoch'] + 1, self.current_epoch + 1, self.global_step, self.best_val_loss)
+                    checkpoint['epoch'], self.current_epoch, self.global_step, self.best_val_loss)
 
     def _describe_curriculum_phase(self, epoch: int) -> str:
         """Return the curriculum phase string for a given epoch."""
@@ -1658,6 +1738,7 @@ class Trainer:
                 LOGGER.debug("Skipping validation for epoch %d (adaptive validation)", epoch + 1)
 
             if (epoch + 1) % self.config.save_every == 0:
+                print(f"[Trainer] 💾 Saving milestone checkpoint (epoch {epoch+1})")
                 LOGGER.info("Saving milestone checkpoint at epoch %d", epoch + 1)
                 self.save_checkpoint(f"checkpoint_epoch_{epoch+1}.pt")
 
@@ -1963,13 +2044,16 @@ def main():
         auto = Path(config.checkpoint_dir) / "last_epoch.pt"
         if auto.exists():
             resume_path = str(auto)
-            print(f"[Main] Auto-resuming from {auto}")
+            print(f"\n[Main] 🔄 Auto-resuming from {auto}")
             LOGGER.info("Auto-resume detected: loading checkpoint from %s", auto)
     
     if resume_path:
+        print(f"[Main] Loading checkpoint: {resume_path}")
         LOGGER.info("Resuming training from checkpoint: %s", resume_path)
         trainer.load_checkpoint(resume_path)
+        print(f"[Main] ✅ Resume successful - continuing training\n")
     else:
+        print(f"[Main] Starting training from scratch (no checkpoint to resume)\n")
         LOGGER.info("Starting training from scratch (no checkpoint to resume)")
 
     LOGGER.info("Starting training loop")
