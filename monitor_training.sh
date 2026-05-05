@@ -3,7 +3,7 @@
 # Monitor training progress without keeping terminal open
 #
 
-CHECKPOINT_DIR="${1:-checkpoints/final_scratch_run}"
+CHECKPOINT_DIR="${1:-checkpoints/final_quality_300_clean_run}"
 LOG_FILE="$CHECKPOINT_DIR/training.log"
 PID_FILE="$CHECKPOINT_DIR/train.pid"
 

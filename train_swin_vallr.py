@@ -471,6 +471,8 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.best_dir = self.checkpoint_dir / "best"
         self.best_dir.mkdir(parents=True, exist_ok=True)
+        self.best_cer_dir = self.checkpoint_dir / "best_cer"
+        self.best_cer_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(self.checkpoint_dir / "logs")
 
         self.artifact_root = get_artifact_root("training")
@@ -494,6 +496,9 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.best_val_cer  = float('inf')
+        self.best_cer_value = float('inf')
+        self.best_cer_epoch = 0
+        self.best_cer_history: List[Dict] = []
         self.best_metrics_history: List[Dict] = []  # one entry per time best is beaten
         
         # OPTIMIZATION: Early stopping tracking
@@ -1267,6 +1272,33 @@ class Trainer:
               f"val_cer={val_cer:.4f}  → saved to {self.best_dir}")
         LOGGER.info("Best model saved successfully to %s", self.best_dir)
 
+    def _save_best_cer(self, val_loss: float, val_cer: float,
+                       train_loss: float, epoch: int) -> None:
+        """Save the best model selected by phoneme CER."""
+        LOGGER.info("Saving best-CER model: epoch=%d, val_loss=%.4f, val_cer=%.4f, train_loss=%.4f",
+                    epoch, val_loss, val_cer, train_loss)
+        self.save_checkpoint_to(self.best_cer_dir / "best_cer_model.pt")
+
+        val_results = getattr(self, '_last_val_results', None) or {}
+        metrics = {
+            "epoch": epoch,
+            "val_loss": round(val_loss, 6),
+            "val_cer": round(val_cer, 6),
+            "val_wer": round(val_results.get('val_wer', 0.0), 6),
+            "train_loss": round(train_loss, 6),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(self.best_cer_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+
+        self.best_cer_history.append(metrics)
+        with open(self.best_cer_dir / "metrics_history.json", "w", encoding="utf-8") as f:
+            json.dump(self.best_cer_history, f, indent=2)
+
+        print(f"[Best CER] epoch={epoch}  val_loss={val_loss:.4f}  "
+              f"val_cer={val_cer:.4f}  → saved to {self.best_cer_dir}")
+        LOGGER.info("Best-CER model saved successfully to %s", self.best_cer_dir)
+
     def _generate_best_figures(self, epoch: int) -> None:
         """
         Generate and save all paper-quality figures into best/figures/.
@@ -1568,6 +1600,8 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_val_cer':  self.best_val_cer,
+            'best_cer_value': self.best_cer_value,
+            'best_cer_epoch': self.best_cer_epoch,
             'best_epoch': self.best_epoch,
             'epochs_without_improvement': self.epochs_without_improvement,
             'config': vars(self.config),
@@ -1576,6 +1610,7 @@ class Trainer:
             'step_metrics': self.step_metrics,
             'val_losses': self.val_losses,
             'epoch_times': self.epoch_times,
+            'best_cer_history': self.best_cer_history,
         }
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
@@ -1591,6 +1626,8 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'best_val_cer': self.best_val_cer,
+            'best_cer_value': self.best_cer_value,
+            'best_cer_epoch': self.best_cer_epoch,
             'best_epoch': self.best_epoch,
             'epochs_without_improvement': self.epochs_without_improvement,
             'config': vars(self.config),
@@ -1599,6 +1636,7 @@ class Trainer:
             'step_metrics': self.step_metrics,
             'val_losses': self.val_losses,
             'epoch_times': self.epoch_times,
+            'best_cer_history': self.best_cer_history,
         }
 
         if self.scaler is not None:
@@ -1625,6 +1663,9 @@ class Trainer:
             loaded_best_epoch = checkpoint.get('best_epoch', checkpoint.get('epoch', -1) + 1)
             self.best_val_loss = float('inf')
             self.best_val_cer = float('inf')
+            self.best_cer_value = float('inf')
+            self.best_cer_epoch = 0
+            self.best_cer_history = []
             self.best_epoch = 0
             self.epochs_without_improvement = 0
             print(f"[Trainer] Loaded model weights only from {checkpoint_path}")
@@ -1642,6 +1683,9 @@ class Trainer:
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.best_val_cer  = checkpoint.get('best_val_cer',  float('inf'))
+        self.best_cer_value = checkpoint.get('best_cer_value', self.best_val_cer)
+        self.best_cer_epoch = checkpoint.get('best_cer_epoch', self.best_epoch)
+        self.best_cer_history = checkpoint.get('best_cer_history', [])
         self.best_epoch = checkpoint.get('best_epoch', 0)
         self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
         self.epoch_metrics = checkpoint.get('epoch_metrics', [])
@@ -1655,6 +1699,12 @@ class Trainer:
             with open(history_path, encoding="utf-8") as f:
                 self.best_metrics_history = json.load(f)
             LOGGER.info("Loaded best metrics history: %d entries", len(self.best_metrics_history))
+
+        cer_history_path = self.best_cer_dir / "metrics_history.json"
+        if cer_history_path.exists():
+            with open(cer_history_path, encoding="utf-8") as f:
+                self.best_cer_history = json.load(f)
+            LOGGER.info("Loaded best-CER metrics history: %d entries", len(self.best_cer_history))
 
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -1810,6 +1860,7 @@ class Trainer:
                 self._save_loss_artifacts()
 
                 val_improved = val_loss < self.best_val_loss
+                cer_improved = val_cer < (self.best_cer_value - self.config.early_stopping_min_delta)
                 if val_loss < self.best_val_loss:
                     improvement = self.best_val_loss - val_loss
                     self.best_val_loss = val_loss
@@ -1829,11 +1880,22 @@ class Trainer:
                     print(f"  No improvement (best: {self.best_val_loss:.4f} at epoch {self.best_epoch})")
                     LOGGER.info("No improvement: current_val_loss=%.4f >= best_val_loss=%.4f (best_epoch=%d)",
                                val_loss, self.best_val_loss, self.best_epoch)
+
+                if cer_improved:
+                    cer_delta = self.best_cer_value - val_cer
+                    self.best_cer_value = val_cer
+                    self.best_cer_epoch = epoch + 1
+                    self.epochs_without_improvement = 0
+                    print(f"  🎯 NEW BEST CER! Improvement: {cer_delta:.4f}")
+                    print(f"  Best-CER Epoch: {self.best_cer_epoch}")
+                    LOGGER.info("New best CER: val_cer=%.4f (improvement=%.4f), val_loss=%.4f, epoch=%d",
+                                val_cer, cer_delta, val_loss, epoch + 1)
+                    self._save_best_cer(val_loss, val_cer, train_loss, epoch + 1)
                 
                 print(f"{'='*60}\n")
                 
                 # EARLY STOPPING CHECK
-                if (not val_improved) and self._check_early_stopping(val_loss):
+                if (not val_improved) and (not cer_improved) and self._check_early_stopping(val_loss):
                     print(f"\n[Trainer] Early stopping triggered - training complete!")
                     LOGGER.info("Training stopped early at epoch %d", epoch + 1)
                     break
@@ -1966,6 +2028,22 @@ def parse_args():
                         help='Use fixed --eval_every validation schedule')
     parser.add_argument('--freeze_visual_encoder', action='store_true',
                         help='Freeze the visual encoder and fine-tune temporal/head layers only')
+    parser.add_argument('--augmentation_strength', type=float, default=1.0,
+                        help='Scale training augmentations from 0.0 to 1.0 (default: 1.0)')
+    parser.add_argument('--disable_augmentation', action='store_true',
+                        help='Disable training augmentations')
+    parser.add_argument('--max_words', type=int, default=0,
+                        help='Quality filter: keep samples with at most N words (0 = disabled)')
+    parser.add_argument('--max_phoneme_length', type=int, default=0,
+                        help='Quality filter: keep samples with at most N phonemes (0 = disabled)')
+    parser.add_argument('--max_ctc_required_frames', type=int, default=0,
+                        help='Quality filter: keep samples whose CTC minimum frames <= N (0 = disabled)')
+    parser.add_argument('--min_word_confidence', type=float, default=0.0,
+                        help='Quality filter: minimum mean Whisper word confidence (0 = disabled)')
+    parser.add_argument('--min_face_frame_rate', type=float, default=0.0,
+                        help='Quality filter: minimum selected-speaker face frame rate (0 = disabled)')
+    parser.add_argument('--min_mouth_motion', type=float, default=0.0,
+                        help='Quality filter: minimum mouth motion score (0 = disabled)')
 
     return parser.parse_args()
 
@@ -2116,11 +2194,28 @@ def main():
 
     print("\n[Main] Creating dataloaders...")
     data_config = DataConfig()
+    if args.disable_augmentation:
+        data_config.augmentation_max_strength = 0.0
+    else:
+        data_config.augmentation_max_strength = max(0.0, float(args.augmentation_strength))
+    data_config.max_words = args.max_words
+    data_config.max_phoneme_length = args.max_phoneme_length
+    data_config.max_ctc_required_frames = args.max_ctc_required_frames
+    data_config.min_word_confidence = args.min_word_confidence
+    data_config.min_face_frame_rate = args.min_face_frame_rate
+    data_config.min_mouth_motion = args.min_mouth_motion
     if args.disable_curriculum:
         data_config.curriculum_phases = (0, 0)
         LOGGER.info("Curriculum learning disabled")
     else:
         LOGGER.info("Curriculum learning enabled: phases=%s", data_config.curriculum_phases)
+    LOGGER.info(
+        "Data filters: max_words=%d max_phoneme_length=%d max_ctc_required_frames=%d "
+        "min_word_confidence=%.3f min_face_frame_rate=%.3f min_mouth_motion=%.3f augmentation_strength=%.2f",
+        data_config.max_words, data_config.max_phoneme_length, data_config.max_ctc_required_frames,
+        data_config.min_word_confidence, data_config.min_face_frame_rate,
+        data_config.min_mouth_motion, data_config.augmentation_max_strength,
+    )
 
     # ── Ensure a video-level train/val/test split exists ─────────────────────
     LOGGER.info("Ensuring train/val/test split exists")

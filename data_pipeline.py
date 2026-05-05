@@ -157,6 +157,14 @@ class DataConfig:
     language_balance: bool = False
     language_balance_power: float = 0.7
 
+    # Training quality filters. Zero disables each filter.
+    max_words: int = 0
+    max_phoneme_length: int = 0
+    max_ctc_required_frames: int = 0
+    min_word_confidence: float = 0.0
+    min_face_frame_rate: float = 0.0
+    min_mouth_motion: float = 0.0
+
 
 @dataclass
 class VisualFilterConfig:
@@ -1346,6 +1354,7 @@ class LipReadingDataset(Dataset):
 
         self.samples = self._load_samples()
         self.samples = self._filter_by_split(self.samples)
+        self.samples = self._filter_by_quality(self.samples)
         self.samples = self._filter_by_phase(self.samples)
 
         split_tag = f" split={split}" if split else ""
@@ -1417,6 +1426,76 @@ class LipReadingDataset(Dataset):
         filtered = [s for s in samples if clip_split.get(s["id"]) == self.split]
         LOGGER.info("Split filter '%s': %d / %d samples kept.", self.split, len(filtered), len(samples))
         return filtered
+
+    def _mean_word_confidence(self, sample: Dict) -> float:
+        probs = [
+            w.get("probability")
+            for w in sample.get("words", [])
+            if isinstance(w.get("probability"), (int, float))
+        ]
+        return float(sum(probs) / len(probs)) if probs else 0.0
+
+    def _ctc_required_frames(self, phonemes: List[str]) -> int:
+        repeats = sum(1 for a, b in zip(phonemes, phonemes[1:]) if a == b)
+        return len(phonemes) + repeats
+
+    def _filter_by_quality(self, samples: List[Dict]) -> List[Dict]:
+        """Remove samples that are too noisy or too dense for 50-frame CTC."""
+        cfg = self.config
+        if (
+            cfg.max_words <= 0
+            and cfg.max_phoneme_length <= 0
+            and cfg.max_ctc_required_frames <= 0
+            and cfg.min_word_confidence <= 0
+            and cfg.min_face_frame_rate <= 0
+            and cfg.min_mouth_motion <= 0
+        ):
+            return samples
+
+        vocab = set(get_phoneme_vocab())
+        vocab.discard("<blank>")
+        kept: List[Dict] = []
+        rejected = Counter()
+
+        for sample in samples:
+            text = sample.get("text", "")
+            word_count = int(sample.get("word_count", len(text.split())))
+            phonemes = [p for p in text_to_phonemes(text) if p in vocab]
+            required_frames = self._ctc_required_frames(phonemes)
+            speaker = sample.get("speaker_selection") or {}
+            face_rate = float(speaker.get("face_frame_rate", 0.0) or 0.0)
+            mouth_motion = float(speaker.get("mouth_motion", 0.0) or 0.0)
+            word_confidence = self._mean_word_confidence(sample)
+
+            if cfg.max_words > 0 and word_count > cfg.max_words:
+                rejected["too_many_words"] += 1
+                continue
+            if cfg.max_phoneme_length > 0 and len(phonemes) > cfg.max_phoneme_length:
+                rejected["too_many_phonemes"] += 1
+                continue
+            if cfg.max_ctc_required_frames > 0 and required_frames > cfg.max_ctc_required_frames:
+                rejected["ctc_too_dense"] += 1
+                continue
+            if cfg.min_word_confidence > 0 and word_confidence < cfg.min_word_confidence:
+                rejected["low_word_confidence"] += 1
+                continue
+            if cfg.min_face_frame_rate > 0 and face_rate < cfg.min_face_frame_rate:
+                rejected["low_face_rate"] += 1
+                continue
+            if cfg.min_mouth_motion > 0 and mouth_motion < cfg.min_mouth_motion:
+                rejected["low_mouth_motion"] += 1
+                continue
+
+            kept.append(sample)
+
+        LOGGER.info(
+            "Quality filter kept %d / %d samples. Rejected: %s",
+            len(kept), len(samples), dict(rejected)
+        )
+        print(f"[Dataset] Quality filter kept {len(kept)} / {len(samples)} samples")
+        if rejected:
+            print(f"[Dataset] Quality filter rejected: {dict(rejected)}")
+        return kept
 
     def _load_samples(self) -> List[Dict]:
         """Load sample metadata."""
