@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import math
+import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Callable
 from dataclasses import dataclass, asdict
@@ -164,6 +165,7 @@ class DataConfig:
     min_word_confidence: float = 0.0
     min_face_frame_rate: float = 0.0
     min_mouth_motion: float = 0.0
+    target_units: str = "phoneme"
 
 
 @dataclass
@@ -1435,9 +1437,24 @@ class LipReadingDataset(Dataset):
         ]
         return float(sum(probs) / len(probs)) if probs else 0.0
 
-    def _ctc_required_frames(self, phonemes: List[str]) -> int:
-        repeats = sum(1 for a, b in zip(phonemes, phonemes[1:]) if a == b)
-        return len(phonemes) + repeats
+    @staticmethod
+    def _normalize_char_text(text: str) -> str:
+        text = (text or "").lower()
+        text = text.replace("’", "'").replace("`", "'").replace("‘", "'")
+        text = re.sub(r"[^a-z'\s]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _target_units_for_filter(self, text: str) -> List[str]:
+        if getattr(self.config, "target_units", "phoneme") == "char":
+            normalized = self._normalize_char_text(text)
+            return list(normalized) if normalized else [" "]
+        vocab = set(get_phoneme_vocab())
+        vocab.discard("<blank>")
+        return [p for p in text_to_phonemes(text) if p in vocab]
+
+    def _ctc_required_frames(self, units: List[str]) -> int:
+        repeats = sum(1 for a, b in zip(units, units[1:]) if a == b)
+        return len(units) + repeats
 
     def _filter_by_quality(self, samples: List[Dict]) -> List[Dict]:
         """Remove samples that are too noisy or too dense for 50-frame CTC."""
@@ -1452,16 +1469,15 @@ class LipReadingDataset(Dataset):
         ):
             return samples
 
-        vocab = set(get_phoneme_vocab())
-        vocab.discard("<blank>")
         kept: List[Dict] = []
         rejected = Counter()
+        target_units = getattr(cfg, "target_units", "phoneme")
 
         for sample in samples:
             text = sample.get("text", "")
             word_count = int(sample.get("word_count", len(text.split())))
-            phonemes = [p for p in text_to_phonemes(text) if p in vocab]
-            required_frames = self._ctc_required_frames(phonemes)
+            units = self._target_units_for_filter(text)
+            required_frames = self._ctc_required_frames(units)
             speaker = sample.get("speaker_selection") or {}
             face_rate = float(speaker.get("face_frame_rate", 0.0) or 0.0)
             mouth_motion = float(speaker.get("mouth_motion", 0.0) or 0.0)
@@ -1470,8 +1486,8 @@ class LipReadingDataset(Dataset):
             if cfg.max_words > 0 and word_count > cfg.max_words:
                 rejected["too_many_words"] += 1
                 continue
-            if cfg.max_phoneme_length > 0 and len(phonemes) > cfg.max_phoneme_length:
-                rejected["too_many_phonemes"] += 1
+            if cfg.max_phoneme_length > 0 and len(units) > cfg.max_phoneme_length:
+                rejected[f"too_many_{target_units}_units"] += 1
                 continue
             if cfg.max_ctc_required_frames > 0 and required_frames > cfg.max_ctc_required_frames:
                 rejected["ctc_too_dense"] += 1
@@ -1489,10 +1505,10 @@ class LipReadingDataset(Dataset):
             kept.append(sample)
 
         LOGGER.info(
-            "Quality filter kept %d / %d samples. Rejected: %s",
-            len(kept), len(samples), dict(rejected)
+            "Quality filter kept %d / %d samples for target_units=%s. Rejected: %s",
+            len(kept), len(samples), target_units, dict(rejected)
         )
-        print(f"[Dataset] Quality filter kept {len(kept)} / {len(samples)} samples")
+        print(f"[Dataset] Quality filter kept {len(kept)} / {len(samples)} samples ({target_units})")
         if rejected:
             print(f"[Dataset] Quality filter rejected: {dict(rejected)}")
         return kept

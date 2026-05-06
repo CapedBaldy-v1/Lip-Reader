@@ -28,9 +28,11 @@ import argparse
 import time
 import math
 import json
+import re
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 from datetime import datetime
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -122,6 +124,28 @@ class TrainingConfig:
     # NEW: Use beam search by default
     use_beam_search: bool = True
     beam_width: int = 10
+    decode_method: str = "greedy"
+    lm_weight: float = 0.0
+    length_bonus: float = 0.0
+    space_bonus: float = 0.0
+
+    # Target units and hybrid objective
+    target_units: str = "phoneme"
+    hybrid_decoder: bool = False
+    ctc_weight: float = 1.0
+    attn_ce_weight: float = 0.0
+    decoder_d_model: int = 256
+    decoder_layers: int = 2
+    decoder_heads: int = 4
+    decoder_dropout: float = 0.1
+
+    # Learning-rate schedule
+    scheduler: str = "constant"
+    onecycle_pct_start: float = 0.12
+    onecycle_div_factor: float = 10.0
+    onecycle_final_div_factor: float = 50.0
+    late_eval_start_epoch: int = 100
+    late_eval_every: int = 3
     
     # OPTIMIZATION: Early stopping for 20-hour deadline
     early_stopping_patience: int = 100  # INCREASED to 100 for slow learning rate (was 20)
@@ -149,51 +173,310 @@ class TrainingConfig:
 
 
 # =============================================================================
-# CTC Loss with Label Preparation
+# Target Units, CTC Loss, and Hybrid Decoder
 # =============================================================================
 
-class CTCLossWrapper(nn.Module):
-    """
-    CTC Loss wrapper that handles label preparation with optional label smoothing.
-    """
+_CHAR_VOCAB = ["<pad>", "<bos>", "<eos>"] + list("abcdefghijklmnopqrstuvwxyz") + ["'", " ", "<blank>"]
 
-    def __init__(self, blank_idx: int = 39, label_smoothing: float = 0.0):
+
+class TargetCodec:
+    """Encode/decode either legacy phoneme targets or normalized character targets."""
+
+    def __init__(self, mode: str = "char"):
+        mode = mode.lower().strip()
+        if mode not in {"char", "phoneme"}:
+            raise ValueError(f"Unsupported target_units={mode!r}; expected char or phoneme")
+
+        self.mode = mode
+        if mode == "char":
+            self.vocab = list(_CHAR_VOCAB)
+            self.pad_token = "<pad>"
+            self.bos_token = "<bos>"
+            self.eos_token = "<eos>"
+            self.blank_token = "<blank>"
+            self.metric_name = "Character CER"
+            self.sample_target_key = "target_text_normalized"
+        else:
+            self.vocab = get_phoneme_vocab()
+            self.pad_token = "<blank>"
+            self.bos_token = "<blank>"
+            self.eos_token = "<blank>"
+            self.blank_token = "<blank>"
+            self.metric_name = "Phoneme Proxy CER"
+            self.sample_target_key = "target_units"
+
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.vocab)}
+        self.idx_to_token = {idx: token for token, idx in self.token_to_idx.items()}
+        self.pad_idx = self.token_to_idx[self.pad_token]
+        self.bos_idx = self.token_to_idx[self.bos_token]
+        self.eos_idx = self.token_to_idx[self.eos_token]
+        self.blank_idx = self.token_to_idx[self.blank_token]
+        self._non_ctc_indices = {self.pad_idx, self.bos_idx, self.eos_idx}
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalize existing metadata text for character-level supervision."""
+        text = (text or "").lower()
+        text = text.replace("’", "'").replace("`", "'").replace("‘", "'")
+        text = re.sub(r"[^a-z'\s]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def ctc_tokens(self, text: str) -> List[str]:
+        if self.mode == "char":
+            normalized = self.normalize_text(text)
+            return list(normalized) if normalized else [" "]
+        return _target_phoneme_sequence(text, self.vocab)
+
+    def ctc_indices(self, text: str) -> List[int]:
+        indices = [self.token_to_idx[token] for token in self.ctc_tokens(text) if token in self.token_to_idx]
+        if not indices:
+            indices = [self.blank_idx]
+        return indices
+
+    def target_string(self, text: str) -> str:
+        if self.mode == "char":
+            return self.normalize_text(text)
+        return " ".join(self.ctc_tokens(text)).lower().strip()
+
+    def decoder_input_target(self, texts: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build padded teacher-forcing inputs and targets for the attention decoder."""
+        inputs: List[List[int]] = []
+        targets: List[List[int]] = []
+        for text in texts:
+            seq = self.ctc_indices(text)
+            inputs.append([self.bos_idx] + seq)
+            targets.append(seq + [self.eos_idx])
+
+        max_len = max(max(len(x) for x in inputs), 1)
+        input_tensor = torch.full((len(inputs), max_len), self.pad_idx, dtype=torch.long, device=device)
+        target_tensor = torch.full((len(targets), max_len), self.pad_idx, dtype=torch.long, device=device)
+        for row, (inp, tgt) in enumerate(zip(inputs, targets)):
+            input_tensor[row, :len(inp)] = torch.tensor(inp, dtype=torch.long, device=device)
+            target_tensor[row, :len(tgt)] = torch.tensor(tgt, dtype=torch.long, device=device)
+        return input_tensor, target_tensor
+
+    def _tokens_to_text(self, tokens: List[str]) -> str:
+        if self.mode == "char":
+            return re.sub(r"\s+", " ", "".join(tokens)).strip()
+        return " ".join(tokens).lower().strip()
+
+    def collapse_indices(self, indices: List[int]) -> str:
+        collapsed: List[str] = []
+        prev_idx: Optional[int] = None
+        for idx in indices:
+            if idx == self.blank_idx:
+                prev_idx = idx
+                continue
+            if idx in self._non_ctc_indices:
+                prev_idx = idx
+                continue
+            if prev_idx == idx:
+                continue
+            token = self.idx_to_token.get(int(idx))
+            if token is not None:
+                collapsed.append(token)
+            prev_idx = idx
+        return self._tokens_to_text(collapsed)
+
+    def decode_greedy(self, log_probs: torch.Tensor) -> List[str]:
+        pred_indices = torch.argmax(log_probs.detach(), dim=-1).cpu().tolist()
+        return [self.collapse_indices(seq) for seq in pred_indices]
+
+    @staticmethod
+    def _logaddexp(a: float, b: float) -> float:
+        if a == -float("inf"):
+            return b
+        if b == -float("inf"):
+            return a
+        return float(np.logaddexp(a, b))
+
+    def _prefix_text(self, prefix: Tuple[int, ...]) -> str:
+        return self._tokens_to_text([self.idx_to_token[idx] for idx in prefix])
+
+    def ctc_prefix_beam_search(
+        self,
+        log_probs: torch.Tensor,
+        beam_width: int = 25,
+        lm: Optional["CharacterNGramLM"] = None,
+        lm_weight: float = 0.20,
+        length_bonus: float = 0.05,
+        space_bonus: float = 0.10,
+    ) -> List[str]:
+        """CTC prefix beam search. LM fusion is only applied for char mode."""
+        if self.mode != "char":
+            return self.decode_greedy(log_probs)
+
+        batch_log_probs = log_probs.detach().float().cpu()
+        decoded: List[str] = []
+        valid_token_indices = [
+            idx for idx in range(len(self.vocab))
+            if idx not in self._non_ctc_indices and idx != self.blank_idx
+        ]
+        neg_inf = -float("inf")
+
+        for sample_log_probs in batch_log_probs:
+            beams: Dict[Tuple[int, ...], Tuple[float, float]] = {(): (0.0, neg_inf)}
+            for frame in sample_log_probs:
+                next_beams: Dict[Tuple[int, ...], Tuple[float, float]] = defaultdict(lambda: (neg_inf, neg_inf))
+
+                # Blank transition.
+                blank_lp = float(frame[self.blank_idx].item())
+                for prefix, (p_blank, p_nonblank) in beams.items():
+                    nb_blank, nb_nonblank = next_beams[prefix]
+                    nb_blank = self._logaddexp(nb_blank, self._logaddexp(p_blank + blank_lp, p_nonblank + blank_lp))
+                    next_beams[prefix] = (nb_blank, nb_nonblank)
+
+                # Character transitions.
+                for token_idx in valid_token_indices:
+                    token_lp = float(frame[token_idx].item())
+                    token = self.idx_to_token[token_idx]
+                    for prefix, (p_blank, p_nonblank) in beams.items():
+                        last_idx = prefix[-1] if prefix else None
+
+                        if token_idx == last_idx:
+                            same_blank, same_nonblank = next_beams[prefix]
+                            same_nonblank = self._logaddexp(same_nonblank, p_nonblank + token_lp)
+                            next_beams[prefix] = (same_blank, same_nonblank)
+                            new_prefix = prefix + (token_idx,)
+                            new_blank, new_nonblank = next_beams[new_prefix]
+                            extension_score = p_blank + token_lp
+                            if lm is not None and lm_weight:
+                                extension_score += lm_weight * lm.score_next(self._prefix_text(prefix), token)
+                            extension_score += length_bonus
+                            if token == " ":
+                                extension_score += space_bonus
+                            new_nonblank = self._logaddexp(new_nonblank, extension_score)
+                        else:
+                            new_prefix = prefix + (token_idx,)
+                            new_blank, new_nonblank = next_beams[new_prefix]
+                            extension_score = self._logaddexp(p_blank, p_nonblank) + token_lp
+                            if lm is not None and lm_weight:
+                                extension_score += lm_weight * lm.score_next(self._prefix_text(prefix), token)
+                            extension_score += length_bonus
+                            if token == " ":
+                                extension_score += space_bonus
+                            new_nonblank = self._logaddexp(new_nonblank, extension_score)
+                        next_beams[new_prefix] = (new_blank, new_nonblank)
+
+                scored = [
+                    (prefix, self._logaddexp(p_blank, p_nonblank))
+                    for prefix, (p_blank, p_nonblank) in next_beams.items()
+                ]
+                scored.sort(key=lambda item: item[1], reverse=True)
+                beams = {prefix: next_beams[prefix] for prefix, _ in scored[:beam_width]}
+
+            best_prefix = max(beams.items(), key=lambda item: self._logaddexp(item[1][0], item[1][1]))[0]
+            decoded.append(self._prefix_text(best_prefix))
+        return decoded
+
+
+class CharacterNGramLM:
+    """Tiny repo-local character n-gram LM for CTC shallow fusion."""
+
+    def __init__(self, texts: List[str], codec: TargetCodec, order: int = 5, smoothing: float = 0.1):
+        self.codec = codec
+        self.order = max(1, int(order))
+        self.smoothing = float(smoothing)
+        self.vocab = [token for token in codec.vocab if len(token) == 1]
+        self.vocab_size = max(len(self.vocab), 1)
+        self.counts: Dict[str, Counter] = defaultdict(Counter)
+        self.totals: Counter = Counter()
+
+        start = "^" * (self.order - 1)
+        for text in texts:
+            normalized = codec.normalize_text(text)
+            if not normalized:
+                continue
+            sequence = start + normalized
+            for idx in range(self.order - 1, len(sequence)):
+                ch = sequence[idx]
+                if ch not in self.vocab:
+                    continue
+                for context_len in range(self.order - 1, -1, -1):
+                    context = sequence[max(0, idx - context_len):idx]
+                    self.counts[context][ch] += 1
+                    self.totals[context] += 1
+
+    def score_next(self, prefix: str, ch: str) -> float:
+        prefix = prefix or ""
+        for context_len in range(min(self.order - 1, len(prefix)), -1, -1):
+            context = prefix[-context_len:] if context_len else ""
+            total = self.totals.get(context, 0)
+            if total > 0:
+                count = self.counts[context].get(ch, 0)
+                return math.log((count + self.smoothing) / (total + self.smoothing * self.vocab_size))
+        return -math.log(self.vocab_size)
+
+
+class HybridAttentionDecoder(nn.Module):
+    """Small Transformer decoder trained with teacher forcing beside CTC."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        feature_dim: int = 512,
+        d_model: int = 256,
+        layers: int = 2,
+        heads: int = 4,
+        dropout: float = 0.1,
+        max_len: int = 96,
+    ):
         super().__init__()
-        self.ctc_loss = nn.CTCLoss(blank=blank_idx, reduction='mean', zero_infinity=True)
-        self.phoneme_vocab = get_phoneme_vocab()
-        self.phoneme_to_idx = {p: i for i, p in enumerate(self.phoneme_vocab)}
-        self.blank_idx = blank_idx
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Embedding(max_len, d_model)
+        self.memory_proj = nn.Linear(feature_dim, d_model)
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=layers)
+        self.output = nn.Linear(d_model, vocab_size)
+        self.max_len = max_len
+
+    def forward(self, features: torch.Tensor, decoder_input: torch.Tensor) -> torch.Tensor:
+        batch, length = decoder_input.shape
+        if length > self.max_len:
+            decoder_input = decoder_input[:, :self.max_len]
+            length = self.max_len
+        positions = torch.arange(length, device=decoder_input.device).unsqueeze(0).expand(batch, length)
+        tgt = self.token_embed(decoder_input) + self.pos_embed(positions)
+        memory = self.memory_proj(features)
+        causal_mask = torch.triu(
+            torch.ones(length, length, device=decoder_input.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        decoded = self.decoder(tgt=tgt, memory=memory, tgt_mask=causal_mask)
+        return self.output(decoded)
+
+
+class CTCLossWrapper(nn.Module):
+    """CTC Loss wrapper for a configurable target codec."""
+
+    def __init__(self, codec: TargetCodec, label_smoothing: float = 0.0):
+        super().__init__()
+        self.codec = codec
+        self.ctc_loss = nn.CTCLoss(blank=codec.blank_idx, reduction='mean', zero_infinity=True)
         self.label_smoothing = label_smoothing
 
     def text_to_targets(self, texts: list) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert text strings to phoneme targets.
-
-        Args:
-            texts: List of text strings
-
-        Returns:
-            targets: Flattened target tensor
-            target_lengths: Length of each target sequence
-        """
-        all_targets = []
-        target_lengths = []
+        all_targets: List[int] = []
+        target_lengths: List[int] = []
 
         for text in texts:
-            phonemes = _target_phoneme_sequence(text, self.phoneme_vocab)
-            indices = [self.phoneme_to_idx[p] for p in phonemes if p in self.phoneme_to_idx]
-            if not indices:
-                LOGGER.warning("Empty phoneme target for text: %s", text)
-                indices = [self.blank_idx]
-
+            indices = self.codec.ctc_indices(text)
             all_targets.extend(indices)
             target_lengths.append(len(indices))
 
         targets = torch.tensor(all_targets, dtype=torch.long)
-        target_lengths = torch.tensor(target_lengths, dtype=torch.long)
+        target_lengths_tensor = torch.tensor(target_lengths, dtype=torch.long)
 
-        LOGGER.debug("Prepared CTC targets: %d sequences", len(target_lengths))
-        return targets, target_lengths
+        LOGGER.debug("Prepared %s CTC targets: %d sequences", self.codec.mode, len(target_lengths))
+        return targets, target_lengths_tensor
 
     def forward(
         self,
@@ -201,18 +484,7 @@ class CTCLossWrapper(nn.Module):
         texts: list,
         input_lengths: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Compute CTC loss with optional label smoothing.
-
-        Args:
-            log_probs: Log probabilities from model (B, T, C)
-            texts: List of target text strings
-            input_lengths: Length of each input sequence
-
-        Returns:
-            CTC loss value
-        """
-        batch_size, time_steps, num_classes = log_probs.shape
+        batch_size, time_steps, _ = log_probs.shape
 
         targets, target_lengths = self.text_to_targets(texts)
         targets = targets.to(log_probs.device)
@@ -221,20 +493,12 @@ class CTCLossWrapper(nn.Module):
         if input_lengths is None:
             input_lengths = torch.full((batch_size,), time_steps, dtype=torch.long, device=log_probs.device)
 
-        log_probs_ctc = log_probs.permute(1, 0, 2)
+        ctc_loss = self.ctc_loss(log_probs.permute(1, 0, 2), targets, input_lengths, target_lengths)
 
-        # Standard CTC loss
-        ctc_loss = self.ctc_loss(log_probs_ctc, targets, input_lengths, target_lengths)
-        
-        # Label smoothing: encourage uniform distribution
         if self.label_smoothing > 0:
             smooth_loss = -log_probs.mean()
-            loss = (1 - self.label_smoothing) * ctc_loss + self.label_smoothing * smooth_loss
-        else:
-            loss = ctc_loss
-
-        LOGGER.debug("CTC loss computed: %f", loss.item())
-        return loss
+            return (1 - self.label_smoothing) * ctc_loss + self.label_smoothing * smooth_loss
+        return ctc_loss
 
 
 # =============================================================================
@@ -419,7 +683,34 @@ class Trainer:
         # OPTIMIZATION: Set random seeds for reproducibility
         self._set_seed(config.seed)
 
-        self.ctc_loss = CTCLossWrapper(label_smoothing=config.label_smoothing)
+        self.codec = TargetCodec(config.target_units)
+        self.ctc_loss = CTCLossWrapper(self.codec, label_smoothing=config.label_smoothing)
+        self.attention_ce_loss = nn.CrossEntropyLoss(ignore_index=self.codec.pad_idx)
+        self.hybrid_decoder: Optional[HybridAttentionDecoder] = None
+        if config.hybrid_decoder:
+            if self.codec.mode != "char":
+                LOGGER.warning("Hybrid decoder requested for non-char target units; disabling decoder.")
+            else:
+                self.hybrid_decoder = HybridAttentionDecoder(
+                    vocab_size=len(self.codec.vocab),
+                    feature_dim=512,
+                    d_model=config.decoder_d_model,
+                    layers=config.decoder_layers,
+                    heads=config.decoder_heads,
+                    dropout=config.decoder_dropout,
+                ).to(device)
+                LOGGER.info(
+                    "Hybrid attention decoder enabled: vocab=%d d_model=%d layers=%d heads=%d",
+                    len(self.codec.vocab), config.decoder_d_model,
+                    config.decoder_layers, config.decoder_heads
+                )
+
+        self.char_lm: Optional[CharacterNGramLM] = None
+        if self.codec.mode == "char" and config.decode_method == "beam_lm":
+            train_samples = getattr(getattr(train_loader, "dataset", None), "samples", [])
+            train_texts = [sample.get("text", "") for sample in train_samples]
+            self.char_lm = CharacterNGramLM(train_texts, self.codec, order=5)
+            LOGGER.info("Built char 5-gram LM from %d train labels.", len(train_texts))
 
         if config.freeze_visual_encoder:
             for param in model.visual_encoder.parameters():
@@ -437,18 +728,20 @@ class Trainer:
 
         if not config.freeze_visual_encoder:
             add_param_group(model.visual_encoder, config.learning_rate * 0.3, 'visual_encoder')
-        add_param_group(model.temporal_adapter, config.learning_rate * 0.5, 'temporal_adapter')
+        add_param_group(model.temporal_adapter, config.learning_rate * 0.6, 'temporal_adapter')
         add_param_group(model.phoneme_head, config.learning_rate, 'phoneme_head')
+        if self.hybrid_decoder is not None:
+            add_param_group(self.hybrid_decoder, config.learning_rate, 'hybrid_decoder')
         
         # Add temporal attention if it exists
         if hasattr(model, 'temporal_attention') and model.temporal_attention is not None:
-            add_param_group(model.temporal_attention, config.learning_rate * 0.5, 'temporal_attention')
+            add_param_group(model.temporal_attention, config.learning_rate * 0.6, 'temporal_attention')
         
         # Add temporal multiscale if it exists
         if hasattr(model, 'temporal_multiscale') and model.temporal_multiscale is not None:
-            add_param_group(model.temporal_multiscale, config.learning_rate * 0.5, 'temporal_multiscale')
+            add_param_group(model.temporal_multiscale, config.learning_rate * 0.6, 'temporal_multiscale')
         if hasattr(model, 'feature_norm') and model.feature_norm is not None:
-            add_param_group(model.feature_norm, config.learning_rate * 0.7, 'feature_norm')
+            add_param_group(model.feature_norm, config.learning_rate * 0.6, 'feature_norm')
 
         if not param_groups:
             raise RuntimeError("No trainable parameters selected. Check freeze/training configuration.")
@@ -460,9 +753,30 @@ class Trainer:
             eps=1e-6
         )
 
-        # Use constant LR scheduler (no warmup/decay) to avoid NaN issues
-        from torch.optim.lr_scheduler import LambdaLR
-        self.scheduler = LambdaLR(self.optimizer, lambda epoch: 1.0)  # Constant LR
+        self._grad_clip_params = [
+            p for group in param_groups for p in group['params']
+        ]
+
+        steps_per_epoch = max(1, math.ceil((10 if config.smoke_test else len(train_loader)) / max(1, config.accumulation_steps)))
+        total_steps = max(1, steps_per_epoch * max(1, config.epochs))
+        if config.scheduler == "onecycle":
+            self.scheduler = OneCycleLR(
+                self.optimizer,
+                max_lr=[group['lr'] for group in param_groups],
+                total_steps=total_steps,
+                pct_start=config.onecycle_pct_start,
+                div_factor=config.onecycle_div_factor,
+                final_div_factor=config.onecycle_final_div_factor,
+            )
+            LOGGER.info(
+                "Using OneCycleLR: total_steps=%d pct_start=%.3f div_factor=%.1f final_div_factor=%.1f",
+                total_steps, config.onecycle_pct_start,
+                config.onecycle_div_factor, config.onecycle_final_div_factor
+            )
+        else:
+            from torch.optim.lr_scheduler import LambdaLR
+            self.scheduler = LambdaLR(self.optimizer, lambda _: 1.0)
+            LOGGER.info("Using constant learning-rate scheduler.")
 
         self.use_amp = False  # DISABLED AMP - causes NaN
         self.scaler = None
@@ -479,8 +793,8 @@ class Trainer:
         self.loss_artifacts = get_useful_dir("training", "loss_curves")
         self.preview_artifacts = get_useful_dir("training", "batch_previews")
 
-        self.step_metrics: List[Tuple[int, float, float, float, float, float]] = []
-        self.epoch_metrics: List[Tuple[int, float, float, float, float, float]] = []
+        self.step_metrics: List[Tuple[int, float, float, float, float, float, float]] = []
+        self.epoch_metrics: List[Tuple[int, float, float, float, float, float, float]] = []
         self.val_losses: List[Tuple[int, float]] = []
         
         # MEMORY LEAK FIX: Limit list sizes to prevent unbounded growth
@@ -500,9 +814,11 @@ class Trainer:
         self.best_cer_epoch = 0
         self.best_cer_history: List[Dict] = []
         self.best_metrics_history: List[Dict] = []  # one entry per time best is beaten
+        self._last_val_results: Optional[Dict] = None
         
         # OPTIMIZATION: Early stopping tracking
         self.epochs_without_improvement = 0
+        self.validations_without_cer_improvement = 0
         self.best_epoch = 0
         
         # OPTIMIZATION: Training time tracking
@@ -534,6 +850,18 @@ class Trainer:
                 "label_smoothing": self.config.label_smoothing,
                 "freeze_visual_encoder": self.config.freeze_visual_encoder,
                 "save_last_every": self.config.save_last_every,
+                "target_units": self.config.target_units,
+                "hybrid_decoder": self.config.hybrid_decoder,
+                "ctc_weight": self.config.ctc_weight,
+                "attn_ce_weight": self.config.attn_ce_weight,
+                "decode_method": self.config.decode_method,
+                "beam_width": self.config.beam_width,
+                "lm_weight": self.config.lm_weight,
+                "length_bonus": self.config.length_bonus,
+                "space_bonus": self.config.space_bonus,
+                "scheduler": self.config.scheduler,
+                "late_eval_start_epoch": self.config.late_eval_start_epoch,
+                "late_eval_every": self.config.late_eval_every,
             }
             save_json(self.artifact_root / "training_config.json", summary)
             save_text(self.artifact_root / "notes.txt", "Training artifacts and metrics.")
@@ -635,7 +963,10 @@ class Trainer:
     def _should_validate_this_epoch(self, epoch: int) -> bool:
         """Determine if we should validate this epoch (adaptive validation)."""
         if not self.config.adaptive_validation:
-            should_validate = (epoch + 1) % self.config.eval_every == 0
+            interval = self.config.eval_every
+            if (epoch + 1) > self.config.late_eval_start_epoch:
+                interval = max(1, self.config.late_eval_every)
+            should_validate = (epoch + 1) % max(1, interval) == 0
             LOGGER.debug("Validation check (non-adaptive): epoch=%d, should_validate=%s",
                         epoch + 1, should_validate)
             return should_validate
@@ -652,33 +983,31 @@ class Trainer:
         
         return should_validate
     
-    def _check_early_stopping(self, val_loss: float) -> bool:
-        """Check if we should stop early. Returns True if we should stop."""
-        improvement = self.best_val_loss - val_loss
-        
-        if val_loss < (self.best_val_loss - self.config.early_stopping_min_delta):
-            # Significant improvement - reset counter and update best epoch
-            self.epochs_without_improvement = 0
-            self.best_epoch = self.current_epoch + 1
-            LOGGER.info("Early stopping: significant improvement detected (delta=%.4f, new_best=%.4f, best_epoch=%d)",
-                       improvement, val_loss, self.best_epoch)
+    def _check_early_stopping(self, cer_improved: bool) -> bool:
+        """Stop after N validations without primary CER improvement."""
+        if cer_improved:
+            self.validations_without_cer_improvement = 0
             return False
-        else:
-            # No significant improvement
-            self.epochs_without_improvement += 1
-            LOGGER.info("Early stopping: no significant improvement (delta=%.4f < min_delta=%.4f, patience=%d/%d, best_epoch=%d)",
-                       improvement, self.config.early_stopping_min_delta,
-                       self.epochs_without_improvement, self.config.early_stopping_patience,
-                       self.best_epoch)
-            
-            if self.epochs_without_improvement >= self.config.early_stopping_patience:
-                print(f"\n[Early Stopping] No improvement for {self.config.early_stopping_patience} epochs")
-                print(f"[Early Stopping] Best epoch was {self.best_epoch} with val_loss={self.best_val_loss:.4f}")
-                LOGGER.warning("Early stopping triggered: no improvement for %d epochs (best_epoch=%d, best_val_loss=%.4f)",
-                              self.config.early_stopping_patience, self.best_epoch, self.best_val_loss)
-                return True
-            
-            return False
+
+        self.validations_without_cer_improvement += 1
+        LOGGER.info(
+            "Early stopping CER patience: %d/%d validations without improvement (best_cer=%.4f epoch=%d)",
+            self.validations_without_cer_improvement,
+            self.config.early_stopping_patience,
+            self.best_cer_value,
+            self.best_cer_epoch,
+        )
+        if self.validations_without_cer_improvement >= self.config.early_stopping_patience:
+            print(f"\n[Early Stopping] No CER improvement for {self.config.early_stopping_patience} validations")
+            print(f"[Early Stopping] Best CER epoch was {self.best_cer_epoch} with CER={self.best_cer_value:.4f}")
+            LOGGER.warning(
+                "Early stopping triggered: no CER improvement for %d validations (best_cer_epoch=%d, best_cer=%.4f)",
+                self.config.early_stopping_patience,
+                self.best_cer_epoch,
+                self.best_cer_value,
+            )
+            return True
+        return False
 
     def _decorrelation_loss(self, features: torch.Tensor) -> torch.Tensor:
         """Penalize cosine similarity between an anchor token and other tokens."""
@@ -762,13 +1091,14 @@ class Trainer:
                 save_csv(
                     self.loss_artifacts / "train_steps.csv",
                     [
-                        (step, total_loss, ctc_loss, decor_loss, smooth_loss, attn_loss)
-                        for step, total_loss, ctc_loss, decor_loss, smooth_loss, attn_loss in self.step_metrics
+                        (step, total_loss, ctc_loss, decoder_loss, decor_loss, smooth_loss, attn_loss)
+                        for step, total_loss, ctc_loss, decoder_loss, decor_loss, smooth_loss, attn_loss in self.step_metrics
                     ],
                     headers=[
                         "step",
                         "total_loss",
                         "ctc_loss",
+                        "decoder_ce_loss",
                         "decorrelation_loss",
                         "smoothness_loss",
                         "attention_entropy_loss"
@@ -777,11 +1107,12 @@ class Trainer:
                 save_line_plot(
                     self.loss_artifacts / "train_step_loss.png",
                     {
-                        "train_step_loss": [loss for _, loss, _, _, _, _ in self.step_metrics],
-                        "train_step_ctc_loss": [loss for _, _, loss, _, _, _ in self.step_metrics],
-                        "train_step_decor_loss": [loss for _, _, _, loss, _, _ in self.step_metrics],
-                        "train_step_smooth_loss": [loss for _, _, _, _, loss, _ in self.step_metrics],
-                        "train_step_attn_loss": [loss for _, _, _, _, _, loss in self.step_metrics]
+                        "train_step_loss": [loss for _, loss, _, _, _, _, _ in self.step_metrics],
+                        "train_step_ctc_loss": [loss for _, _, loss, _, _, _, _ in self.step_metrics],
+                        "train_step_decoder_loss": [loss for _, _, _, loss, _, _, _ in self.step_metrics],
+                        "train_step_decor_loss": [loss for _, _, _, _, loss, _, _ in self.step_metrics],
+                        "train_step_smooth_loss": [loss for _, _, _, _, _, loss, _ in self.step_metrics],
+                        "train_step_attn_loss": [loss for _, _, _, _, _, _, loss in self.step_metrics]
                     },
                     title="Train Step Loss"
                 )
@@ -794,17 +1125,19 @@ class Trainer:
                             epoch,
                             train_loss,
                             train_ctc_loss,
+                            train_decoder_loss,
                             train_decorr_loss,
                             train_smooth_loss,
                             train_attn_loss,
                             self._val_loss_for_epoch(epoch)
                         )
-                        for epoch, train_loss, train_ctc_loss, train_decorr_loss, train_smooth_loss, train_attn_loss in self.epoch_metrics
+                        for epoch, train_loss, train_ctc_loss, train_decoder_loss, train_decorr_loss, train_smooth_loss, train_attn_loss in self.epoch_metrics
                     ],
                     headers=[
                         "epoch",
                         "train_loss",
                         "train_ctc_loss",
+                        "train_decoder_ce_loss",
                         "train_decorr_loss",
                         "train_smooth_loss",
                         "train_attn_loss",
@@ -813,14 +1146,15 @@ class Trainer:
                 )
 
                 series = {
-                    "train_epoch_loss": [loss for _, loss, _, _, _, _ in self.epoch_metrics],
-                    "train_epoch_ctc_loss": [loss for _, _, loss, _, _, _ in self.epoch_metrics],
-                    "train_epoch_smooth_loss": [loss for _, _, _, _, loss, _ in self.epoch_metrics],
-                    "train_epoch_attn_loss": [loss for _, _, _, _, _, loss in self.epoch_metrics]
+                    "train_epoch_loss": [loss for _, loss, _, _, _, _, _ in self.epoch_metrics],
+                    "train_epoch_ctc_loss": [loss for _, _, loss, _, _, _, _ in self.epoch_metrics],
+                    "train_epoch_decoder_loss": [loss for _, _, _, loss, _, _, _ in self.epoch_metrics],
+                    "train_epoch_smooth_loss": [loss for _, _, _, _, _, loss, _ in self.epoch_metrics],
+                    "train_epoch_attn_loss": [loss for _, _, _, _, _, _, loss in self.epoch_metrics]
                 }
                 if self.config.decorrelation_weight > 0:
                     series["train_epoch_decor_loss"] = [
-                        loss for _, _, _, loss, _, _ in self.epoch_metrics
+                        loss for _, _, _, _, loss, _, _ in self.epoch_metrics
                     ]
                 if self.val_losses:
                     series["val_epoch_loss"] = [loss for _, loss in self.val_losses]
@@ -890,12 +1224,13 @@ class Trainer:
             return
         try:
             out_dir = get_useful_dir("training", "sample_predictions")
-            decoded = self.model.decode_ctc(logits.detach())
+            decoded = self.codec.decode_greedy(logits.detach())
             samples = []
             for i in range(min(3, len(decoded))):
                 samples.append({
                     "target_text": texts[i] if i < len(texts) else "",
-                    "predicted_phonemes": decoded[i]
+                    "target_units": self.codec.target_string(texts[i]) if i < len(texts) else "",
+                    "predicted_units": decoded[i],
                 })
             save_json(out_dir / f"epoch_{epoch+1}.json", {"samples": samples})
             self._prediction_epochs.add(epoch)
@@ -911,7 +1246,7 @@ class Trainer:
             if (batch_idx + 1) % self.config.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
+                    self._grad_clip_params,
                     self.config.gradient_clip
                 )
                 
@@ -930,7 +1265,7 @@ class Trainer:
             loss.backward()
             if (batch_idx + 1) % self.config.accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
+                    self._grad_clip_params,
                     self.config.gradient_clip
                 )
                 
@@ -949,6 +1284,7 @@ class Trainer:
         self,
         total_loss: float,
         ctc_loss: float,
+        decoder_loss: float,
         decor_loss: float,
         smooth_loss: float,
         attn_loss: float
@@ -956,6 +1292,8 @@ class Trainer:
         """Write training metrics to TensorBoard."""
         self.writer.add_scalar('train/loss', total_loss, self.global_step)
         self.writer.add_scalar('train/ctc_loss', ctc_loss, self.global_step)
+        if self.hybrid_decoder is not None:
+            self.writer.add_scalar('train/decoder_ce_loss', decoder_loss, self.global_step)
         if self.config.decorrelation_weight > 0:
             self.writer.add_scalar('train/decorrelation_loss', decor_loss, self.global_step)
         if self.config.temporal_smoothness_weight > 0:
@@ -964,12 +1302,28 @@ class Trainer:
             self.writer.add_scalar('train/attention_entropy_loss', attn_loss, self.global_step)
         self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
 
+    def _hybrid_decoder_loss(self, features: torch.Tensor, texts: List[str]) -> torch.Tensor:
+        """Compute teacher-forced attention decoder CE loss when enabled."""
+        if self.hybrid_decoder is None or self.config.attn_ce_weight <= 0:
+            return torch.tensor(0.0, device=features.device)
+        decoder_input, decoder_target = self.codec.decoder_input_target(texts, features.device)
+        decoder_logits = self.hybrid_decoder(features, decoder_input)
+        if decoder_target.shape[1] != decoder_logits.shape[1]:
+            decoder_target = decoder_target[:, :decoder_logits.shape[1]]
+        return self.attention_ce_loss(
+            decoder_logits.reshape(-1, decoder_logits.shape[-1]),
+            decoder_target.reshape(-1)
+        )
+
     def train_epoch(self) -> float:
         """Train for one epoch."""
         self.model.train()
+        if self.hybrid_decoder is not None:
+            self.hybrid_decoder.train()
 
         total_loss = 0.0
         total_ctc_loss = 0.0
+        total_decoder_loss = 0.0
         total_decor_loss = 0.0
         total_smooth_loss = 0.0
         total_attn_loss = 0.0
@@ -1013,11 +1367,13 @@ class Trainer:
                     features, attn_weights = self._extract_training_features(video)
                     logits = self.model.phoneme_head(features)
                     ctc_loss = self.ctc_loss(logits, texts)
+                    decoder_loss = self._hybrid_decoder_loss(features, texts)
                     decor_loss = self._decorrelation_loss(features)
                     smooth_loss = self._temporal_smoothness_loss(logits)
                     attn_loss = self._attention_entropy_loss(attn_weights, device=logits.device)
                     loss = (
-                        ctc_loss
+                        self.config.ctc_weight * ctc_loss
+                        + self.config.attn_ce_weight * decoder_loss
                         + self.config.decorrelation_weight * decor_loss
                         + self.config.temporal_smoothness_weight * smooth_loss
                         + self.config.attention_entropy_weight * attn_loss
@@ -1026,11 +1382,13 @@ class Trainer:
                 features, attn_weights = self._extract_training_features(video)
                 logits = self.model.phoneme_head(features)
                 ctc_loss = self.ctc_loss(logits, texts)
+                decoder_loss = self._hybrid_decoder_loss(features, texts)
                 decor_loss = self._decorrelation_loss(features)
                 smooth_loss = self._temporal_smoothness_loss(logits)
                 attn_loss = self._attention_entropy_loss(attn_weights, device=logits.device)
                 loss = (
-                    ctc_loss
+                    self.config.ctc_weight * ctc_loss
+                    + self.config.attn_ce_weight * decoder_loss
                     + self.config.decorrelation_weight * decor_loss
                     + self.config.temporal_smoothness_weight * smooth_loss
                     + self.config.attention_entropy_weight * attn_loss
@@ -1044,24 +1402,26 @@ class Trainer:
             if self.config.detect_nan and (torch.isnan(loss) or torch.isinf(loss)):
                 LOGGER.error("NaN or Inf loss detected at epoch %d, batch %d! Stopping training.", 
                            self.current_epoch + 1, batch_idx)
-                LOGGER.error("Loss components: ctc=%.4f, decor=%.4f, smooth=%.4f, attn=%.4f",
-                           ctc_loss.item(), decor_loss.item(), smooth_loss.item(), attn_loss.item())
+                LOGGER.error("Loss components: ctc=%.4f, decoder=%.4f, decor=%.4f, smooth=%.4f, attn=%.4f",
+                           ctc_loss.item(), decoder_loss.item(), decor_loss.item(), smooth_loss.item(), attn_loss.item())
                 raise RuntimeError(f"NaN/Inf loss detected at epoch {self.current_epoch + 1}, batch {batch_idx}")
 
             self._run_backward(loss, batch_idx)
 
             total_loss += loss.item()
             total_ctc_loss += ctc_loss.item()
+            total_decoder_loss += decoder_loss.item()
             total_decor_loss += decor_loss.item()
             total_smooth_loss += smooth_loss.item()
             total_attn_loss += attn_loss.item()
             num_batches += 1
             self.global_step += 1
             LOGGER.debug(
-                "Train step=%s total_loss=%f ctc_loss=%f decor_loss=%f smooth_loss=%f attn_loss=%f",
+                "Train step=%s total_loss=%f ctc_loss=%f decoder_loss=%f decor_loss=%f smooth_loss=%f attn_loss=%f",
                 self.global_step,
                 loss.item(),
                 ctc_loss.item(),
+                decoder_loss.item(),
                 decor_loss.item(),
                 smooth_loss.item(),
                 attn_loss.item()
@@ -1072,6 +1432,7 @@ class Trainer:
                     self.global_step,
                     float(loss.detach().cpu().item()),
                     float(ctc_loss.detach().cpu().item()),
+                    float(decoder_loss.detach().cpu().item()),
                     float(decor_loss.detach().cpu().item()),
                     float(smooth_loss.detach().cpu().item()),
                     float(attn_loss.detach().cpu().item())
@@ -1088,13 +1449,14 @@ class Trainer:
                 self._log_training_step(
                     loss.item(),
                     ctc_loss.item(),
+                    decoder_loss.item(),
                     decor_loss.item(),
                     smooth_loss.item(),
                     attn_loss.item()
                 )
             
             # MEMORY LEAK FIX: Explicitly delete tensors to free memory
-            del video, logits, features, loss, ctc_loss, decor_loss, smooth_loss, attn_loss
+            del video, logits, features, loss, ctc_loss, decoder_loss, decor_loss, smooth_loss, attn_loss
             if 'attn_weights' in locals():
                 del attn_weights
         
@@ -1116,27 +1478,29 @@ class Trainer:
         Also stores per-sample predictions in self._last_val_results for figure generation."""
         LOGGER.info("Starting validation for epoch %d", self.current_epoch + 1)
         self.model.eval()
+        if self.hybrid_decoder is not None:
+            self.hybrid_decoder.eval()
 
         total_loss  = 0.0
-        total_cer   = 0.0
+        total_primary_cer = 0.0
+        total_greedy_cer = 0.0
         total_wer   = 0.0
         num_batches = 0
         num_samples = 0
 
-        # Phoneme-level confusion: true_phoneme -> {pred_phoneme: count}
-        phoneme_vocab = get_phoneme_vocab()
-        ph_to_idx = {p: i for i, p in enumerate(phoneme_vocab)}
-        n_ph = len(phoneme_vocab)
-        confusion = np.zeros((n_ph, n_ph), dtype=np.int64)
+        unit_vocab = list(self.codec.vocab)
+        unit_to_idx = {p: i for i, p in enumerate(unit_vocab)}
+        n_units = len(unit_vocab)
+        confusion = np.zeros((n_units, n_units), dtype=np.int64)
 
-        # Per-phoneme correct / total
-        ph_correct = np.zeros(n_ph, dtype=np.int64)
-        ph_total   = np.zeros(n_ph, dtype=np.int64)
+        unit_correct = np.zeros(n_units, dtype=np.int64)
+        unit_total   = np.zeros(n_units, dtype=np.int64)
 
         # Store sample-level results for qualitative table
         # MEMORY LEAK FIX: Limit number of samples stored
         sample_results: List[Dict] = []
         max_samples_to_store = 100  # Only store first 100 samples
+        max_val_batches = 5 if self.config.smoke_test else len(self.val_loader)
 
         use_tqdm = self.val_loader.num_workers > 0
         if use_tqdm:
@@ -1146,65 +1510,88 @@ class Trainer:
             iterator = enumerate(self.val_loader)
 
         for batch_idx, batch in iterator:
+            if batch_idx >= max_val_batches:
+                break
             if not use_tqdm and batch_idx % 10 == 0:
                 print(f"{batch_idx}/{len(self.val_loader)}...", end="", flush=True)
 
             video = batch['video'].to(self.device)
             texts = batch['text']
 
-            logits = self.model(video)
-            loss   = self.ctc_loss(logits, texts)
+            features, _ = self._extract_training_features(video)
+            logits = self.model.phoneme_head(features)
+            ctc_loss = self.ctc_loss(logits, texts)
+            decoder_loss = self._hybrid_decoder_loss(features, texts)
+            loss = self.config.ctc_weight * ctc_loss + self.config.attn_ce_weight * decoder_loss
             total_loss  += loss.item()
             num_batches += 1
 
             try:
-                preds = self.model.decode_ctc(logits)
-                for pred_phonemes, target_text in zip(preds, texts):
-                    pred_str    = ' '.join(pred_phonemes).lower().strip()
-                    tgt_phonemes = _target_phoneme_sequence(target_text, phoneme_vocab)
-                    target_str  = ' '.join(tgt_phonemes).lower().strip()
+                greedy_preds = self.codec.decode_greedy(logits)
+                if self.config.decode_method == "beam_lm":
+                    primary_preds = self.codec.ctc_prefix_beam_search(
+                        logits,
+                        beam_width=self.config.beam_width,
+                        lm=self.char_lm,
+                        lm_weight=self.config.lm_weight,
+                        length_bonus=self.config.length_bonus,
+                        space_bonus=self.config.space_bonus,
+                    )
+                else:
+                    primary_preds = greedy_preds
 
-                    # CER is now measured on the phoneme string. WER is a
-                    # phoneme-token error rate proxy, not English word WER.
+                for pred_str, greedy_str, target_text in zip(primary_preds, greedy_preds, texts):
+                    target_str = self.codec.target_string(target_text)
+
                     cer = _char_error_rate(pred_str, target_str) if target_str else 0.0
-                    total_cer  += cer
+                    greedy_cer = _char_error_rate(greedy_str, target_str) if target_str else 0.0
+                    total_primary_cer += cer
+                    total_greedy_cer += greedy_cer
                     num_samples += 1
 
                     wer = _word_error_rate(pred_str, target_str)
                     total_wer += wer
 
-                    # Phoneme confusion: align predicted phonemes vs target phonemes
-                    _update_confusion(confusion, ph_correct, ph_total,
-                                      tgt_phonemes, pred_phonemes, ph_to_idx)
+                    target_units = self.codec.ctc_tokens(target_text)
+                    pred_units = list(pred_str) if self.codec.mode == "char" else pred_str.split()
+                    _update_confusion(confusion, unit_correct, unit_total,
+                                      target_units, pred_units, unit_to_idx)
 
                     # MEMORY LEAK FIX: Only store limited number of samples
                     if len(sample_results) < max_samples_to_store:
                         sample_results.append({
-                            "target":    target_text,
-                            "target_phonemes": target_str,
+                            "target": target_text,
+                            "target_units": target_str,
                             "predicted": pred_str,
-                            "cer":       round(cer, 4),
-                            "wer":       round(wer, 4),
+                            "greedy_predicted": greedy_str,
+                            "cer": round(cer, 4),
+                            "greedy_cer": round(greedy_cer, 4),
+                            "wer": round(wer, 4),
                         })
             except Exception as e:
                 LOGGER.warning("Error during validation decoding: %s", str(e))
                 pass
 
-            del video, logits, loss
+            del video, features, logits, loss, ctc_loss, decoder_loss
 
         if not use_tqdm:
             print("Done!", flush=True)
 
         avg_loss = total_loss / max(num_batches, 1)
-        avg_cer  = total_cer  / max(num_samples, 1)
+        avg_cer  = total_primary_cer  / max(num_samples, 1)
+        avg_greedy_cer = total_greedy_cer / max(num_samples, 1)
         avg_wer  = total_wer  / max(num_samples, 1)
 
         self.writer.add_scalar('val/loss', avg_loss, self.current_epoch)
         self.writer.add_scalar('val/cer',  avg_cer,  self.current_epoch)
+        self.writer.add_scalar('val/greedy_cer', avg_greedy_cer, self.current_epoch)
         self.writer.add_scalar('val/wer',  avg_wer,  self.current_epoch)
         
-        LOGGER.info("Validation complete: epoch=%d, batches=%d, samples=%d, loss=%.4f, cer=%.4f, wer=%.4f",
-                    self.current_epoch + 1, num_batches, num_samples, avg_loss, avg_cer, avg_wer)
+        LOGGER.info(
+            "Validation complete: epoch=%d, batches=%d, samples=%d, loss=%.4f, primary_cer=%.4f, greedy_cer=%.4f, wer=%.4f, decode=%s",
+            self.current_epoch + 1, num_batches, num_samples, avg_loss,
+            avg_cer, avg_greedy_cer, avg_wer, self.config.decode_method
+        )
         
         self.val_losses.append((self.current_epoch + 1, avg_loss))
 
@@ -1212,11 +1599,14 @@ class Trainer:
         self._last_val_results = {
             "val_loss":      avg_loss,
             "val_cer":       avg_cer,
+            "greedy_cer":     avg_greedy_cer,
             "val_wer":       avg_wer,
             "confusion":     confusion,
-            "ph_correct":    ph_correct,
-            "ph_total":      ph_total,
-            "phoneme_vocab": phoneme_vocab,
+            "ph_correct":    unit_correct,
+            "ph_total":      unit_total,
+            "phoneme_vocab": unit_vocab,
+            "unit_label":    "Character" if self.codec.mode == "char" else "Phoneme",
+            "decode_method": self.config.decode_method,
             "samples":       sample_results,
         }
         
@@ -1250,7 +1640,10 @@ class Trainer:
             "val_loss":   round(val_loss,  6),
             "val_cer":    round(val_cer,   6),
             "val_wer":    round(getattr(self, '_last_val_results', {}).get('val_wer', 0.0), 6),
+            "greedy_cer": round(getattr(self, '_last_val_results', {}).get('greedy_cer', 0.0), 6),
             "train_loss": round(train_loss, 6),
+            "target_units": self.codec.mode,
+            "decode_method": self.config.decode_method,
             "timestamp":  datetime.now().isoformat(timespec="seconds"),
         }
         with open(self.best_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -1274,7 +1667,7 @@ class Trainer:
 
     def _save_best_cer(self, val_loss: float, val_cer: float,
                        train_loss: float, epoch: int) -> None:
-        """Save the best model selected by phoneme CER."""
+        """Save the best model selected by primary CER."""
         LOGGER.info("Saving best-CER model: epoch=%d, val_loss=%.4f, val_cer=%.4f, train_loss=%.4f",
                     epoch, val_loss, val_cer, train_loss)
         self.save_checkpoint_to(self.best_cer_dir / "best_cer_model.pt")
@@ -1285,7 +1678,10 @@ class Trainer:
             "val_loss": round(val_loss, 6),
             "val_cer": round(val_cer, 6),
             "val_wer": round(val_results.get('val_wer', 0.0), 6),
+            "greedy_cer": round(val_results.get('greedy_cer', 0.0), 6),
             "train_loss": round(train_loss, 6),
+            "target_units": self.codec.mode,
+            "decode_method": self.config.decode_method,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         with open(self.best_cer_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -1413,10 +1809,12 @@ class Trainer:
                 ax.plot(epochs_x, [m[2] for m in self.epoch_metrics],
                         label="CTC",          linewidth=1.5)
                 ax.plot(epochs_x, [m[3] for m in self.epoch_metrics],
-                        label="Decorrelation", linewidth=1.5, linestyle="--")
+                        label="Decoder CE", linewidth=1.5, linestyle="--")
                 ax.plot(epochs_x, [m[4] for m in self.epoch_metrics],
-                        label="Smoothness",    linewidth=1.5, linestyle="-.")
+                        label="Decorrelation", linewidth=1.5, linestyle="-.")
                 ax.plot(epochs_x, [m[5] for m in self.epoch_metrics],
+                        label="Smoothness",    linewidth=1.5, linestyle=":")
+                ax.plot(epochs_x, [m[6] for m in self.epoch_metrics],
                         label="Attn Entropy",  linewidth=1.5, linestyle=":")
                 ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
                 ax.set_title("Loss Component Breakdown")
@@ -1434,6 +1832,7 @@ class Trainer:
             ph_correct    = vr["ph_correct"]
             ph_total      = vr["ph_total"]
             phoneme_vocab = vr["phoneme_vocab"]
+            unit_label    = vr.get("unit_label", "Phoneme")
             samples       = vr["samples"]
 
             # Only keep phonemes that actually appeared
@@ -1460,11 +1859,11 @@ class Trainer:
                             rotation=90, fontsize=max(4, min(8, 120 // n)))
                         ax.set_yticks(range(n)); ax.set_yticklabels(sub_vocab,
                             fontsize=max(4, min(8, 120 // n)))
-                        ax.set_xlabel("Predicted Phoneme")
-                        ax.set_ylabel("True Phoneme")
-                        title = ("Phoneme Confusion Matrix (Normalised)"
+                        ax.set_xlabel(f"Predicted {unit_label}")
+                        ax.set_ylabel(f"True {unit_label}")
+                        title = (f"{unit_label} Confusion Matrix (Normalised)"
                                  if "norm" in tag else
-                                 "Phoneme Confusion Matrix (Raw Counts)")
+                                 f"{unit_label} Confusion Matrix (Raw Counts)")
                         ax.set_title(title)
                         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                         fig.tight_layout()
@@ -1488,7 +1887,7 @@ class Trainer:
                     ax.set_xticklabels(sorted_vocab, rotation=90,
                                        fontsize=max(5, min(9, 200 // len(sorted_vocab))))
                     ax.set_ylabel("Accuracy")
-                    ax.set_title("Per-Phoneme Recognition Accuracy")
+                    ax.set_title(f"Per-{unit_label} Recognition Accuracy")
                     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
                     ax.axhline(ph_acc.mean(), color="navy", linestyle="--",
                                linewidth=1.5, label=f"Mean {ph_acc.mean():.1%}")
@@ -1519,7 +1918,7 @@ class Trainer:
                         ax.set_yticks(range(top_k))
                         ax.set_yticklabels(labels[::-1], fontsize=9)
                         ax.set_xlabel("Count")
-                        ax.set_title(f"Top {top_k} Most Confused Phoneme Pairs\n"
+                        ax.set_title(f"Top {top_k} Most Confused {unit_label} Pairs\n"
                                      "(true → predicted)")
                         ax.grid(True, alpha=0.3, axis="x")
                         fig.tight_layout()
@@ -1532,14 +1931,16 @@ class Trainer:
             try:
                 lines = [f"Best model — epoch {epoch}",
                          f"Val CER: {vr['val_cer']:.4f}  "
+                         f"Greedy CER: {vr.get('greedy_cer', 0.0):.4f}  "
                          f"Val WER: {vr['val_wer']:.4f}",
                          "=" * 60]
                 for i, s in enumerate(samples[:20], 1):
                     lines += [
                         f"\n[{i}]",
                         f"  Target:    {s['target']}",
-                        f"  Target PH: {s.get('target_phonemes', '')}",
+                        f"  Target Units: {s.get('target_units', '')}",
                         f"  Predicted: {s['predicted']}",
+                        f"  Greedy:    {s.get('greedy_predicted', '')}",
                         f"  CER: {s['cer']:.4f}   WER: {s['wer']:.4f}",
                     ]
                 (fig_dir / "10_sample_predictions.txt").write_text(
@@ -1554,7 +1955,7 @@ class Trainer:
                 "val_loss":            round(self.best_val_loss, 6),
                 "val_cer":             round(self.best_val_cer,  6),
                 "val_wer":             round(vr["val_wer"] if vr else 0.0, 6),
-                "train_loss_at_best":  round(train_loss if 'train_loss' in dir() else 0.0, 6),
+                "train_loss_at_best":  round(train_losses[-1] if train_losses else 0.0, 6),
                 "total_epochs_so_far": epoch,
                 "improvement_history": self.best_metrics_history,
             }
@@ -1565,10 +1966,7 @@ class Trainer:
 
         LOGGER.info("All publication-ready figures generated successfully: 11 files saved to %s", fig_dir)
         
-        # MEMORY LEAK FIX: Clear validation results after figure generation
-        self._last_val_results = None
         gc.collect()
-        LOGGER.debug("Cleared validation results and collected garbage after figure generation")
 
     def _atomic_torch_save(self, checkpoint: Dict, path: Path) -> None:
         """Save a checkpoint through a per-process temp file, then replace.
@@ -1604,6 +2002,7 @@ class Trainer:
             'best_cer_epoch': self.best_cer_epoch,
             'best_epoch': self.best_epoch,
             'epochs_without_improvement': self.epochs_without_improvement,
+            'validations_without_cer_improvement': self.validations_without_cer_improvement,
             'config': vars(self.config),
             'model_config': asdict(self.model.config),
             'epoch_metrics': self.epoch_metrics,
@@ -1611,7 +2010,10 @@ class Trainer:
             'val_losses': self.val_losses,
             'epoch_times': self.epoch_times,
             'best_cer_history': self.best_cer_history,
+            'target_units': self.codec.mode,
         }
+        if self.hybrid_decoder is not None:
+            checkpoint['hybrid_decoder_state_dict'] = self.hybrid_decoder.state_dict()
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         self._atomic_torch_save(checkpoint, path)
@@ -1630,6 +2032,7 @@ class Trainer:
             'best_cer_epoch': self.best_cer_epoch,
             'best_epoch': self.best_epoch,
             'epochs_without_improvement': self.epochs_without_improvement,
+            'validations_without_cer_improvement': self.validations_without_cer_improvement,
             'config': vars(self.config),
             'model_config': asdict(self.model.config),
             'epoch_metrics': self.epoch_metrics,
@@ -1637,7 +2040,11 @@ class Trainer:
             'val_losses': self.val_losses,
             'epoch_times': self.epoch_times,
             'best_cer_history': self.best_cer_history,
+            'target_units': self.codec.mode,
         }
+
+        if self.hybrid_decoder is not None:
+            checkpoint['hybrid_decoder_state_dict'] = self.hybrid_decoder.state_dict()
 
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
@@ -1656,6 +2063,8 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        if self.hybrid_decoder is not None and 'hybrid_decoder_state_dict' in checkpoint:
+            self.hybrid_decoder.load_state_dict(checkpoint['hybrid_decoder_state_dict'])
         if weights_only:
             self.current_epoch = 0
             self.global_step = 0
@@ -1668,6 +2077,7 @@ class Trainer:
             self.best_cer_history = []
             self.best_epoch = 0
             self.epochs_without_improvement = 0
+            self.validations_without_cer_improvement = 0
             print(f"[Trainer] Loaded model weights only from {checkpoint_path}")
             print(f"[Trainer] Previous source best was val_loss={loaded_best_loss:.4f} (epoch {loaded_best_epoch})")
             print("[Trainer] Reset optimizer and best tracking for the new fine-tune run")
@@ -1688,6 +2098,7 @@ class Trainer:
         self.best_cer_history = checkpoint.get('best_cer_history', [])
         self.best_epoch = checkpoint.get('best_epoch', 0)
         self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
+        self.validations_without_cer_improvement = checkpoint.get('validations_without_cer_improvement', 0)
         self.epoch_metrics = checkpoint.get('epoch_metrics', [])
         self.step_metrics  = checkpoint.get('step_metrics', [])
         self.val_losses = checkpoint.get('val_losses', [])
@@ -1732,6 +2143,10 @@ class Trainer:
         print(f"[Trainer] Batch size: {self.config.batch_size} (effective: {self.config.batch_size * self.config.accumulation_steps})")
         print(f"[Trainer] Learning rate: {self.config.learning_rate}")
         print(f"[Trainer] Curriculum phases: {self.config.curriculum_phases}")
+        print(f"[Trainer] Target units: {self.codec.mode}")
+        print(f"[Trainer] Decode method: {self.config.decode_method}")
+        if self.hybrid_decoder is not None:
+            print(f"[Trainer] Hybrid decoder: enabled (CTC + {self.config.attn_ce_weight:.2f} * CE)")
         print(f"[Trainer] Early stopping patience: {self.config.early_stopping_patience}")
         if self.config.time_budget_hours > 0:
             print(f"[Trainer] Time budget: {self.config.time_budget_hours:.1f} hours")
@@ -1810,22 +2225,25 @@ class Trainer:
             LOGGER.info("Epoch %d train loss: %.4f", epoch + 1, train_loss)
             
             avg_ctc = total_ctc = 0.0
+            avg_decoder = total_decoder = 0.0
             avg_decor = total_decor = 0.0
             avg_smooth = total_smooth = 0.0
             avg_attn = total_attn = 0.0
             if self.step_metrics:
                 last_steps = self.step_metrics[-len(self.train_loader):]
                 total_ctc = sum(item[2] for item in last_steps)
-                total_decor = sum(item[3] for item in last_steps)
-                total_smooth = sum(item[4] for item in last_steps)
-                total_attn = sum(item[5] for item in last_steps)
+                total_decoder = sum(item[3] for item in last_steps)
+                total_decor = sum(item[4] for item in last_steps)
+                total_smooth = sum(item[5] for item in last_steps)
+                total_attn = sum(item[6] for item in last_steps)
                 avg_ctc = total_ctc / max(len(last_steps), 1)
+                avg_decoder = total_decoder / max(len(last_steps), 1)
                 avg_decor = total_decor / max(len(last_steps), 1)
                 avg_smooth = total_smooth / max(len(last_steps), 1)
                 avg_attn = total_attn / max(len(last_steps), 1)
-                LOGGER.debug("Epoch %d loss components: ctc=%.4f, decor=%.4f, smooth=%.4f, attn=%.4f",
-                            epoch + 1, avg_ctc, avg_decor, avg_smooth, avg_attn)
-            self.epoch_metrics.append((epoch + 1, train_loss, avg_ctc, avg_decor, avg_smooth, avg_attn))
+                LOGGER.debug("Epoch %d loss components: ctc=%.4f, decoder=%.4f, decor=%.4f, smooth=%.4f, attn=%.4f",
+                            epoch + 1, avg_ctc, avg_decoder, avg_decor, avg_smooth, avg_attn)
+            self.epoch_metrics.append((epoch + 1, train_loss, avg_ctc, avg_decoder, avg_decor, avg_smooth, avg_attn))
             self._save_loss_artifacts()
 
             # NOTE: scheduler.step() is now called after each optimizer.step() in _run_backward()
@@ -1851,9 +2269,12 @@ class Trainer:
             if self._should_validate_this_epoch(epoch):
                 LOGGER.info("Running validation for epoch %d", epoch + 1)
                 val_loss, val_cer = self.validate()
+                val_results = self._last_val_results or {}
                 
                 print(f"  Val Loss: {val_loss:.4f}")
-                print(f"  Val Phoneme CER: {val_cer:.2%} (lower is better)")
+                print(f"  Val {self.codec.metric_name}: {val_cer:.2%} (lower is better)")
+                if "greedy_cer" in val_results:
+                    print(f"  Greedy CER: {val_results['greedy_cer']:.2%}")
                 
                 LOGGER.info("Epoch %d validation: val_loss=%.4f, val_cer=%.4f",
                             epoch + 1, val_loss, val_cer)
@@ -1866,11 +2287,10 @@ class Trainer:
                     self.best_val_loss = val_loss
                     self.best_val_cer  = val_cer
                     self.best_epoch = epoch + 1  # Update best_epoch here too!
-                    self.epochs_without_improvement = 0
                     
                     print(f"  🎉 NEW BEST MODEL! Improvement: {improvement:.4f}")
                     print(f"  Best Val Loss: {val_loss:.4f}")
-                    print(f"  Best Val Phoneme CER: {val_cer:.2%}")
+                    print(f"  Best Val {self.codec.metric_name}: {val_cer:.2%}")
                     print(f"  Best Epoch: {self.best_epoch}")
                     
                     LOGGER.info("New best model: val_loss=%.4f (improvement=%.4f), val_cer=%.4f, best_epoch=%d",
@@ -1885,7 +2305,7 @@ class Trainer:
                     cer_delta = self.best_cer_value - val_cer
                     self.best_cer_value = val_cer
                     self.best_cer_epoch = epoch + 1
-                    self.epochs_without_improvement = 0
+                    self.validations_without_cer_improvement = 0
                     print(f"  🎯 NEW BEST CER! Improvement: {cer_delta:.4f}")
                     print(f"  Best-CER Epoch: {self.best_cer_epoch}")
                     LOGGER.info("New best CER: val_cer=%.4f (improvement=%.4f), val_loss=%.4f, epoch=%d",
@@ -1895,7 +2315,7 @@ class Trainer:
                 print(f"{'='*60}\n")
                 
                 # EARLY STOPPING CHECK
-                if (not val_improved) and (not cer_improved) and self._check_early_stopping(val_loss):
+                if self._check_early_stopping(cer_improved):
                     print(f"\n[Trainer] Early stopping triggered - training complete!")
                     LOGGER.info("Training stopped early at epoch %d", epoch + 1)
                     break
@@ -1963,6 +2383,39 @@ def parse_args():
                         help='Gradient accumulation steps (default: 2)')
     parser.add_argument('--label_smoothing', type=float, default=0.0,
                         help='Optional CTC label smoothing weight (default: 0.0)')
+    parser.add_argument('--target_units', type=str, default='char',
+                        choices=['char', 'phoneme'],
+                        help='Target units for CTC: char is real normalized text; phoneme is legacy proxy')
+    parser.add_argument('--hybrid_decoder', action='store_true',
+                        help='Add a small teacher-forced attention decoder beside CTC')
+    parser.add_argument('--ctc_weight', type=float, default=1.0,
+                        help='Weight for CTC loss (default: 1.0)')
+    parser.add_argument('--attn_ce_weight', type=float, default=0.0,
+                        help='Weight for hybrid attention decoder CE loss (default: 0.0)')
+    parser.add_argument('--decode_method', type=str, default='greedy',
+                        choices=['greedy', 'beam_lm'],
+                        help='Validation decode method (default: greedy)')
+    parser.add_argument('--beam_width', type=int, default=25,
+                        help='CTC prefix beam width for beam_lm decode (default: 25)')
+    parser.add_argument('--lm_weight', type=float, default=0.20,
+                        help='Char LM shallow-fusion weight (default: 0.20)')
+    parser.add_argument('--length_bonus', type=float, default=0.05,
+                        help='Beam-search character extension bonus (default: 0.05)')
+    parser.add_argument('--space_bonus', type=float, default=0.10,
+                        help='Beam-search word-space bonus (default: 0.10)')
+    parser.add_argument('--scheduler', type=str, default='constant',
+                        choices=['constant', 'onecycle'],
+                        help='Learning-rate scheduler (default: constant)')
+    parser.add_argument('--onecycle_pct_start', type=float, default=0.12,
+                        help='OneCycle warmup fraction (default: 0.12)')
+    parser.add_argument('--onecycle_div_factor', type=float, default=10.0,
+                        help='OneCycle initial LR divisor (default: 10)')
+    parser.add_argument('--onecycle_final_div_factor', type=float, default=50.0,
+                        help='OneCycle final LR divisor (default: 50)')
+    parser.add_argument('--late_eval_start_epoch', type=int, default=100,
+                        help='After this epoch, use --late_eval_every for fixed validation schedule')
+    parser.add_argument('--late_eval_every', type=int, default=3,
+                        help='Fixed validation interval after --late_eval_start_epoch (default: 3)')
 
     parser.add_argument('--load_refiner', action='store_true',
                         help='Load Qwen2 refiner for joint training')
@@ -2032,6 +2485,8 @@ def parse_args():
                         help='Scale training augmentations from 0.0 to 1.0 (default: 1.0)')
     parser.add_argument('--disable_augmentation', action='store_true',
                         help='Disable training augmentations')
+    parser.add_argument('--deadline_quality_profile', action='store_true',
+                        help='Apply repo-local char hybrid defaults for the under-10h deadline run')
     parser.add_argument('--max_words', type=int, default=0,
                         help='Quality filter: keep samples with at most N words (0 = disabled)')
     parser.add_argument('--max_phoneme_length', type=int, default=0,
@@ -2057,6 +2512,21 @@ def _build_training_config(args) -> TrainingConfig:
     config.weight_decay = args.weight_decay
     config.accumulation_steps = args.accumulation_steps
     config.label_smoothing = args.label_smoothing
+    config.target_units = args.target_units
+    config.hybrid_decoder = args.hybrid_decoder
+    config.ctc_weight = args.ctc_weight
+    config.attn_ce_weight = args.attn_ce_weight
+    config.decode_method = args.decode_method
+    config.beam_width = args.beam_width
+    config.lm_weight = args.lm_weight
+    config.length_bonus = args.length_bonus
+    config.space_bonus = args.space_bonus
+    config.scheduler = args.scheduler
+    config.onecycle_pct_start = args.onecycle_pct_start
+    config.onecycle_div_factor = args.onecycle_div_factor
+    config.onecycle_final_div_factor = args.onecycle_final_div_factor
+    config.late_eval_start_epoch = args.late_eval_start_epoch
+    config.late_eval_every = args.late_eval_every
     config.checkpoint_dir = args.checkpoint_dir
     config.save_every = args.save_every
     config.save_last_every = args.save_last_every
@@ -2183,7 +2653,9 @@ def main():
                config.early_stopping_patience, config.time_budget_hours, config.seed)
 
     print("\n[Main] Creating model...")
+    codec = TargetCodec(config.target_units)
     model_config = _build_model_config(args)
+    model_config.num_phonemes = len(codec.vocab)
     model = create_model(load_refiner=args.load_refiner, config=model_config)
     LOGGER.info("Model created: load_refiner=%s, temporal_multiscale=%s, temporal_attention_layers=%d",
                args.load_refiner, model_config.temporal_multiscale, model_config.temporal_attention_layers)
@@ -2194,10 +2666,30 @@ def main():
 
     print("\n[Main] Creating dataloaders...")
     data_config = DataConfig()
+    data_config.target_units = config.target_units
     if args.disable_augmentation:
         data_config.augmentation_max_strength = 0.0
     else:
         data_config.augmentation_max_strength = max(0.0, float(args.augmentation_strength))
+    if args.deadline_quality_profile:
+        data_config.augmentation_ramp_epochs = 25
+        data_config.augmentation_max_strength = min(data_config.augmentation_max_strength, 0.20)
+        data_config.random_erasing_prob = 0.0
+        data_config.beard_occlusion_prob = 0.0
+        data_config.black_bar_prob = 0.0
+        data_config.gaussian_blur_prob = 0.0
+        data_config.downscale_prob = 0.0
+        data_config.profile_warp_prob = 0.0
+        data_config.speed_perturb_prob = 0.0
+        data_config.frame_dropout_prob = min(data_config.frame_dropout_prob, 0.05)
+        data_config.temporal_mask_prob = min(data_config.temporal_mask_prob, 0.10)
+        data_config.temporal_mask_max_len = min(data_config.temporal_mask_max_len, 4)
+        data_config.random_crop_prob = min(data_config.random_crop_prob, 0.20)
+        data_config.brightness_jitter = min(data_config.brightness_jitter, 0.08)
+        data_config.contrast_jitter = min(data_config.contrast_jitter, 0.08)
+        data_config.gaussian_noise_prob = min(data_config.gaussian_noise_prob, 0.05)
+        data_config.rotation_prob = min(data_config.rotation_prob, 0.05)
+        LOGGER.info("Deadline quality profile enabled: mild augmentation and char-friendly defaults.")
     data_config.max_words = args.max_words
     data_config.max_phoneme_length = args.max_phoneme_length
     data_config.max_ctc_required_frames = args.max_ctc_required_frames
@@ -2211,10 +2703,10 @@ def main():
         LOGGER.info("Curriculum learning enabled: phases=%s", data_config.curriculum_phases)
     LOGGER.info(
         "Data filters: max_words=%d max_phoneme_length=%d max_ctc_required_frames=%d "
-        "min_word_confidence=%.3f min_face_frame_rate=%.3f min_mouth_motion=%.3f augmentation_strength=%.2f",
+        "min_word_confidence=%.3f min_face_frame_rate=%.3f min_mouth_motion=%.3f augmentation_strength=%.2f target_units=%s",
         data_config.max_words, data_config.max_phoneme_length, data_config.max_ctc_required_frames,
         data_config.min_word_confidence, data_config.min_face_frame_rate,
-        data_config.min_mouth_motion, data_config.augmentation_max_strength,
+        data_config.min_mouth_motion, data_config.augmentation_max_strength, data_config.target_units,
     )
 
     # ── Ensure a video-level train/val/test split exists ─────────────────────

@@ -3,7 +3,7 @@
 # Stop training gracefully
 #
 
-CHECKPOINT_DIR="${1:-checkpoints/final_quality_300_clean_run}"
+CHECKPOINT_DIR="${1:-checkpoints/final_char_hybrid_300_run}"
 PID_FILE="$CHECKPOINT_DIR/train.pid"
 
 if [ ! -f "$PID_FILE" ]; then
